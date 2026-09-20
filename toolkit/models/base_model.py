@@ -121,10 +121,12 @@ class BaseModel:
         self.torch_dtype = get_torch_dtype(dtype)
         self.device_torch = torch.device(device)
 
-        self.vae_device_torch = torch.device(device)
+        # model_config can pin the vae / text encoder to another gpu (e.g. keep
+        # the te off the primary card when pipeline sharding fills it)
+        self.vae_device_torch = torch.device(model_config.vae_device or device)
         self.vae_torch_dtype = get_torch_dtype(model_config.vae_dtype)
 
-        self.te_device_torch = torch.device(device)
+        self.te_device_torch = torch.device(model_config.te_device or device)
         self.te_torch_dtype = get_torch_dtype(model_config.te_dtype)
 
         self.model_config = model_config
@@ -1739,12 +1741,21 @@ class BaseModel:
             # device would either OOM or be immediately undone
             device = None
 
+        # quantize on the component's own gpu when it has one: quantizing a te
+        # pinned to another card on the primary would stage every block through
+        # a gpu that may already be full (pipeline sharding)
+        quantize_device = self.device_torch
+        if role == "te":
+            _te_dev = torch.device(self.te_device_torch)
+            if _te_dev.type == "cuda":
+                quantize_device = _te_dev
+
         return dict(
             qtype=qtype,
             offload=offload,
             dtype=dtype,
             device=device,
-            quantize_device=self.device_torch,
+            quantize_device=quantize_device,
             base_model=self,
             use_comfy_weights=mc.model_kwargs.get("use_comfy_weights", True),
             pipeline_devices=pipeline_devices,

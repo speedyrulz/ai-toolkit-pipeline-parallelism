@@ -235,14 +235,18 @@ class QwenImage21Model(BaseModel):
     # Text encoding
     # ------------------------------------------------------------------
     def get_prompt_embeds(self, prompt) -> PromptEmbeds:
+        # the te may be pinned to another gpu (te_device); encode there and
+        # hand the embeddings back on the trainer's device
         te = unwrap_model(self.text_encoder)
-        if te.device != self.device_torch:
-            te.to(self.device_torch)
+        te_device = torch.device(self.te_device_torch)
+        if te.device != te_device:
+            te.to(te_device)
 
         prompt_embeds, prompt_embeds_mask, _ = self.pipeline.encode_prompt(
             prompt,
-            device=self.device_torch,
+            device=te_device,
         )
+        prompt_embeds = prompt_embeds.to(self.device_torch)
         # the pipeline returns None when nothing is padded
         if prompt_embeds_mask is None:
             prompt_embeds_mask = torch.ones(
@@ -250,6 +254,8 @@ class QwenImage21Model(BaseModel):
                 device=prompt_embeds.device,
                 dtype=torch.int64,
             )
+        else:
+            prompt_embeds_mask = prompt_embeds_mask.to(self.device_torch)
         pe = PromptEmbeds(prompt_embeds)
         pe.attention_mask = prompt_embeds_mask
         return pe
