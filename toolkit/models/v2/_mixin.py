@@ -195,6 +195,8 @@ class OstrisModelMixin:
         config=None,
         subfolder: Optional[str] = None,
         use_comfy_weights: bool = True,
+        pipeline_devices: Optional[List] = None,
+        pipeline_balance: Optional[List[float]] = None,
         **kwargs,
     ):
         """One-call component load. Resolves/downloads the source (comfy
@@ -233,6 +235,8 @@ class OstrisModelMixin:
             base_model=base_model,
             quantize_device=quantize_device,
             exclude_quant_modules=exclude_quant_modules,
+            pipeline_devices=pipeline_devices,
+            pipeline_balance=pipeline_balance,
         )
 
     def aitk_post_load(
