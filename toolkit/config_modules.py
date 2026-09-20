@@ -711,6 +711,20 @@ class ModelConfig:
         if self.auto_memory:
             print("auto_memory is deprecated, use layer_offloading instead")
         self.layer_offloading = kwargs.get("layer_offloading", self.auto_memory )
+
+        # pipeline sharding: split the transformer's repeated blocks across
+        # multiple gpus (single process, no NCCL) so models bigger than one
+        # gpu's vram train without cpu offloading.
+        self.pipeline_sharding = kwargs.get("pipeline_sharding", False)
+        # devices to shard over; first device holds the non-block modules and
+        # is where the trainer runs. Defaults to all visible cuda devices.
+        self.pipeline_devices: Optional[List[str]] = kwargs.get("pipeline_devices", None)
+        # optional per-device weight ratios, e.g. [0.45, 0.55]
+        self.pipeline_balance: Optional[List[float]] = kwargs.get("pipeline_balance", None)
+        if self.pipeline_sharding and (self.low_vram or self.layer_offloading):
+            raise ValueError(
+                "pipeline_sharding cannot be combined with low_vram or layer_offloading"
+            )
         if self.layer_offloading and self.qtype == "qfloat8":
             self.qtype = "float8"
         if self.layer_offloading and self.qtype_te == "qfloat8":

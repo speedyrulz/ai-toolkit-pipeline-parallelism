@@ -774,6 +774,16 @@ class BaseSDTrainProcess(BaseTrainProcess):
         self.optimizer = self.accelerator.prepare(self.optimizer)
         if self.lr_scheduler is not None:
             self.lr_scheduler = self.accelerator.prepare(self.lr_scheduler)
+
+        # pipeline-sharded model: accelerator.prepare() just moved the network
+        # (and any adapter) onto the accelerator device, collapsing the per-block
+        # placement done at network creation time; put every adapter module back
+        # on the device of the layer it wraps. The unet itself is protected by
+        # the shard manager's .to() override.
+        if self.sd.unet is not None and hasattr(unwrap_model(self.sd.unet), "_shard_manager"):
+            from toolkit.pipeline_sharding import PipelineShardManager
+            if self.sd.network is not None:
+                PipelineShardManager.align_network(unwrap_model(self.sd.network))
         # self.data_loader = self.accelerator.prepare(self.data_loader)
         # if self.data_loader_reg is not None:
         #     self.data_loader_reg = self.accelerator.prepare(self.data_loader_reg)
@@ -1991,6 +2001,12 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     self.train_config.train_text_encoder,
                     self.train_config.train_unet
                 )
+
+                if unet is not None and hasattr(unet, "_shard_manager"):
+                    # pipeline-sharded model: adapter modules must live on the
+                    # device of the layer they wrap, not the force_to device
+                    from toolkit.pipeline_sharding import PipelineShardManager
+                    PipelineShardManager.align_network(self.network)
 
                 # we cannot merge in if quantized or offloading. note: torchao quantized weights can
                 # still be force merged at save time for the merge-and-reset method (see save logic),

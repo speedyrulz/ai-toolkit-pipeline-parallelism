@@ -391,7 +391,9 @@ class LokrModule(ToolkitModuleMixin, nn.Module):
             drop = torch.rand(delta.size(-1), device=delta.device) < self.rank_dropout
             delta = delta * drop.to(delta.dtype)
 
-        multiplier = torch.mean(self.network_ref().torch_multiplier).to(compute_dtype)
+        multiplier = torch.mean(self.network_ref().torch_multiplier).to(
+            device=delta.device, dtype=compute_dtype
+        )
         delta = delta * multiplier
 
         return (base_out + delta).to(orig_dtype)
@@ -415,7 +417,7 @@ class LokrModule(ToolkitModuleMixin, nn.Module):
             x = x.to(dtype=orig_weight.dtype)
 
         # we do not currently support split batch multipliers for lokr. Just do a mean
-        multiplier = torch.mean(multiplier)
+        multiplier = torch.mean(multiplier).to(device=lokr_weight.device)
 
         weight = (
             orig_weight

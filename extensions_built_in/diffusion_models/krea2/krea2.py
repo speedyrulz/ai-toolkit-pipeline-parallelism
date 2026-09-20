@@ -431,7 +431,43 @@ class Krea2Model(BaseModel):
                 ],
             )
 
-        if self.model_config.low_vram:
+        if self.model_config.pipeline_sharding:
+            from toolkit.pipeline_sharding import PipelineShardManager
+
+            self.print_and_status_update("Sharding transformer across gpus")
+            # the primary (first) device holds the non-block modules and must be
+            # the trainer's device: the model's output lands there and the loss
+            # math runs against tensors on it
+            _train_dev = torch.device(self.device_torch)
+            _train_idx = _train_dev.index if _train_dev.index is not None else 0
+            devices = self.model_config.pipeline_devices
+            if devices is None:
+                devices = [f"cuda:{_train_idx}"] + [
+                    f"cuda:{i}"
+                    for i in range(torch.cuda.device_count())
+                    if i != _train_idx
+                ]
+            else:
+                devices = [str(torch.device(d)) for d in devices]
+                primary = f"cuda:{_train_idx}"
+                if devices[0] != primary:
+                    if primary in devices:
+                        devices.remove(primary)
+                    devices.insert(0, primary)
+                    self.print_and_status_update(
+                        f"pipeline_devices reordered to {devices}: the trainer "
+                        f"device ({primary}) must be the primary shard device"
+                    )
+            PipelineShardManager.attach(
+                transformer,
+                devices=devices,
+                block_names=self.get_transformer_block_names(),
+                # quantized weights only move devices; dtype casting them here
+                # would dequantize
+                dtype=None if self.model_config.quantize else dtype,
+                balance=self.model_config.pipeline_balance,
+            )
+        elif self.model_config.low_vram:
             self.print_and_status_update("Moving transformer to CPU")
             transformer.to("cpu")
         else:

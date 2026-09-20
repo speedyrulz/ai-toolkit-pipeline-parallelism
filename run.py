@@ -16,6 +16,27 @@ if "SEED" in os.environ:
 
 sys.path.insert(0, os.getcwd())
 
+# Pipeline sharding needs every gpu visible, but the UI pins the job to its
+# selected gpu via CUDA_VISIBLE_DEVICES. Peek at the config file(s) before
+# torch initializes cuda and lift the restriction when the job asks for
+# sharding (config may be json or yaml, so match both spellings).
+if os.environ.get("CUDA_VISIBLE_DEVICES") is not None:
+    for _arg in sys.argv[1:]:
+        try:
+            if not os.path.isfile(_arg):
+                continue
+            with open(_arg, "r", encoding="utf-8") as _f:
+                _cfg_text = _f.read()
+            if '"pipeline_sharding": true' in _cfg_text or "pipeline_sharding: true" in _cfg_text:
+                print(
+                    "pipeline_sharding requested: clearing CUDA_VISIBLE_DEVICES "
+                    f"(was {os.environ['CUDA_VISIBLE_DEVICES']}) so all gpus are visible"
+                )
+                del os.environ["CUDA_VISIBLE_DEVICES"]
+                break
+        except Exception:
+            pass
+
 # The UI launches jobs with no console; keep anything we shell out to (torch
 # compiles, HF git downloads) from flashing a console window. Must come before
 # any import that might spawn a subprocess.

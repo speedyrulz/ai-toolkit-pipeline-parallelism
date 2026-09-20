@@ -626,7 +626,17 @@ class Automagic3(torch.optim.Optimizer):
                 for p in group["params"]
                 if p in self.state and "lr" in self.state[p]
             ]
-            out.append(float(torch.stack(lrs).mean()) if lrs else float(group["lr"]))
+            if lrs:
+                dev = lrs[0].device
+                out.append(
+                    float(
+                        torch.stack(
+                            [t if t.device == dev else t.to(dev) for t in lrs]
+                        ).mean()
+                    )
+                )
+            else:
+                out.append(float(group["lr"]))
         return out
 
     def get_avg_learning_rate(self) -> float:
