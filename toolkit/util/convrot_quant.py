@@ -537,15 +537,16 @@ def _fp4_dequant_op(
     kernel = _get_dequant_kernel()
     block_b = 1024
     grid = (rows, -(-half // block_b))
-    kernel[grid](
-        packed.contiguous(),
-        scales_u8.view(torch.float8_e4m3fn),
-        pts_u8.view(torch.float32),
-        out,
-        half * 2,
-        BLOCK_B=block_b,
-        num_warps=4,
-    )
+    with torch.cuda.device(packed.device):
+        kernel[grid](
+            packed.contiguous(),
+            scales_u8.view(torch.float8_e4m3fn),
+            pts_u8.view(torch.float32),
+            out,
+            half * 2,
+            BLOCK_B=block_b,
+            num_warps=4,
+        )
     return out
 
 
@@ -917,7 +918,8 @@ def _int8_act_quant_op(x: torch.Tensor, qmax: int) -> list[torch.Tensor]:
     kernel, _ = _get_int8_kernels()
     # triton block shapes must be powers of 2; loads/stores are masked on offs < K
     block_k = min(2048, 1 << (K - 1).bit_length())
-    kernel[(rows,)](x, q, scales, K, QMAX=qmax, BLOCK_K=block_k, num_warps=8)
+    with torch.cuda.device(x.device):
+        kernel[(rows,)](x, q, scales, K, QMAX=qmax, BLOCK_K=block_k, num_warps=8)
     return [q, scales]
 
 
@@ -943,17 +945,18 @@ def _int8_epilogue_op(
     out = torch.empty(m, n, device=i32.device, dtype=getattr(torch, out_dtype))
     _, kernel = _get_int8_kernels()
     grid = (m, -(-n // 1024))
-    kernel[grid](
-        i32,
-        a_scales,
-        w_scales,
-        bias if bias is not None else a_scales,
-        out,
-        n,
-        HAS_BIAS=bias is not None,
-        BLOCK_N=1024,
-        num_warps=4,
-    )
+    with torch.cuda.device(i32.device):
+        kernel[grid](
+            i32,
+            a_scales,
+            w_scales,
+            bias if bias is not None else a_scales,
+            out,
+            n,
+            HAS_BIAS=bias is not None,
+            BLOCK_N=1024,
+            num_warps=4,
+        )
     return out
 
 
@@ -1823,16 +1826,17 @@ def _unpack_intn_impl(
         n_groups = rows * cols // 8
         BLOCK = 256
         kernel = _get_intn_kernel()
-        kernel[(-(-n_groups // BLOCK),)](
-            packed,
-            out,
-            n_groups,
-            BITS=bits,
-            BPOW=max(2, 1 << (bits - 1).bit_length()),
-            QMAX=(1 << (bits - 1)) - 1,
-            BLOCK=BLOCK,
-            num_warps=4,
-        )
+        with torch.cuda.device(packed.device):
+            kernel[(-(-n_groups // BLOCK),)](
+                packed,
+                out,
+                n_groups,
+                BITS=bits,
+                BPOW=max(2, 1 << (bits - 1).bit_length()),
+                QMAX=(1 << (bits - 1)) - 1,
+                BLOCK=BLOCK,
+                num_warps=4,
+            )
         return out
     return unpack_intn_rows(packed, bits, rows, cols)
 
@@ -1847,20 +1851,21 @@ def _unpack_intn_grouped_impl(
         group = cols // ngprow
         BLOCK = 256
         kernel = _get_intn_grouped_kernel()
-        kernel[(-(-n_groups // BLOCK),)](
-            packed,
-            gratio,
-            out,
-            n_groups,
-            cols // 8,
-            group // 8,
-            ngprow,
-            BITS=bits,
-            BPOW=max(2, 1 << (bits - 1).bit_length()),
-            QMAX=(1 << (bits - 1)) - 1,
-            BLOCK=BLOCK,
-            num_warps=4,
-        )
+        with torch.cuda.device(packed.device):
+            kernel[(-(-n_groups // BLOCK),)](
+                packed,
+                gratio,
+                out,
+                n_groups,
+                cols // 8,
+                group // 8,
+                ngprow,
+                BITS=bits,
+                BPOW=max(2, 1 << (bits - 1).bit_length()),
+                QMAX=(1 << (bits - 1)) - 1,
+                BLOCK=BLOCK,
+                num_warps=4,
+            )
         return out
     return unpack_intn_rows_grouped(packed, gratio, bits, rows, cols)
 
@@ -2099,29 +2104,30 @@ def _int_gemv_op(
     # BN=16 (heavier per-program unpack alu)
     BLOCK_N = 16 if packed else 32
     BLOCK_K = 256
-    kernel[(-(-N // BLOCK_N),)](
-        x2d.contiguous(),
-        qdata,
-        gratio if grouped else ws,
-        ws,
-        bias if bias is not None else ws,
-        out,
-        m,
-        K,
-        N,
-        qdata.shape[1],
-        ngprow,
-        gdiv,
-        QMAX_A=act_qmax,
-        BITS=bits,
-        PACKED=packed,
-        GROUPED=grouped,
-        HAS_BIAS=bias is not None,
-        BLOCK_N=BLOCK_N,
-        BLOCK_K=BLOCK_K,
-        num_warps=4,
-        num_stages=2,
-    )
+    with torch.cuda.device(x2d.device):
+        kernel[(-(-N // BLOCK_N),)](
+            x2d.contiguous(),
+            qdata,
+            gratio if grouped else ws,
+            ws,
+            bias if bias is not None else ws,
+            out,
+            m,
+            K,
+            N,
+            qdata.shape[1],
+            ngprow,
+            gdiv,
+            QMAX_A=act_qmax,
+            BITS=bits,
+            PACKED=packed,
+            GROUPED=grouped,
+            HAS_BIAS=bias is not None,
+            BLOCK_N=BLOCK_N,
+            BLOCK_K=BLOCK_K,
+            num_warps=4,
+            num_stages=2,
+        )
     return out
 
 
@@ -2210,18 +2216,19 @@ def _unpack_bitnet_impl(
         ngprow = gratio.shape[1]
         BLOCK = 256
         kernel = _get_bitnet_kernel()
-        kernel[(-(-n_bytes // BLOCK),)](
-            packed,
-            gratio,
-            out,
-            n_bytes,
-            bpr,
-            cols,
-            cols // ngprow,
-            ngprow,
-            BLOCK=BLOCK,
-            num_warps=4,
-        )
+        with torch.cuda.device(packed.device):
+            kernel[(-(-n_bytes // BLOCK),)](
+                packed,
+                gratio,
+                out,
+                n_bytes,
+                bpr,
+                cols,
+                cols // ngprow,
+                ngprow,
+                BLOCK=BLOCK,
+                num_warps=4,
+            )
         return out
     return unpack_ternary_rows_grouped(packed, gratio, rows, cols)
 
