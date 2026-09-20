@@ -60,7 +60,7 @@ scheduler_config = {
 }
 
 
-class QwenImage21Transformer(_QwenImage21Transformer2DModel, OstrisModelMixin):
+class QwenImage21Transformer2DModel(_QwenImage21Transformer2DModel, OstrisModelMixin):
     aitk_subfolder = "transformer"
     aitk_config_repo = BASE_REPO
 
@@ -262,7 +262,7 @@ class QwenImage21Model(BaseModel):
             components_path = model_path
 
         self.print_and_status_update("Loading transformer")
-        transformer = QwenImage21Transformer.load_model(
+        transformer = QwenImage21Transformer2DModel.load_model(
             model_path,
             dtype=dtype,
             token=HF_TOKEN,
@@ -560,7 +560,7 @@ class QwenImage21Model(BaseModel):
         return False
 
     def save_model(self, output_path, meta, save_dtype):
-        transformer: QwenImage21Transformer = unwrap_model(self.model)
+        transformer: QwenImage21Transformer2DModel = unwrap_model(self.model)
         if not output_path.endswith(".safetensors"):
             output_path += ".safetensors"
         transformer.save_model(
