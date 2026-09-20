@@ -12,6 +12,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Qwen-Image 2.1 transformer, vendored from diffusers (Apache 2.0).
+
+Vendored rather than imported because `QwenImage21Transformer2DModel` landed in
+diffusers after the version this repo pins. Two deliberate changes from
+upstream:
+
+  - the SwiGLU feed forward keeps the ComfyUI **fused** `img_mlp.gate_up`
+    projection ([gate; up] row-concatenated) instead of the split
+    `gate_layer`/`proj` pair, so a Comfy-Org checkpoint (bf16 or int8_convrot)
+    loads with no key surgery and a LoRA trained here targets the same module
+    names ComfyUI has,
+  - `OstrisModelMixin` on the model class, for the toolkit's universal
+    load/quantize/offload path.
+"""
+
 import math
 from typing import Any
 
@@ -31,6 +46,8 @@ from diffusers.models.embeddings import TimestepEmbedding
 from diffusers.models.modeling_outputs import Transformer2DModelOutput
 from diffusers.models.modeling_utils import ModelMixin
 from diffusers.models.normalization import RMSNorm
+
+from toolkit.models.v2._mixin import OstrisModelMixin
 
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
@@ -113,14 +130,20 @@ def apply_rotary_emb_qwen(
 
         if use_real_unbind_dim == -1:
             # Used for flux, cogvideox, hunyuan-dit
-            x_real, x_imag = x.reshape(*x.shape[:-1], -1, 2).unbind(-1)  # [B, S, H, D//2]
+            x_real, x_imag = x.reshape(*x.shape[:-1], -1, 2).unbind(
+                -1
+            )  # [B, S, H, D//2]
             x_rotated = torch.stack([-x_imag, x_real], dim=-1).flatten(3)
         elif use_real_unbind_dim == -2:
             # Used for Stable Audio, OmniGen, CogView4 and Cosmos
-            x_real, x_imag = x.reshape(*x.shape[:-1], 2, -1).unbind(-2)  # [B, S, H, D//2]
+            x_real, x_imag = x.reshape(*x.shape[:-1], 2, -1).unbind(
+                -2
+            )  # [B, S, H, D//2]
             x_rotated = torch.cat([-x_imag, x_real], dim=-1)
         else:
-            raise ValueError(f"`use_real_unbind_dim={use_real_unbind_dim}` but should be -1 or -2.")
+            raise ValueError(
+                f"`use_real_unbind_dim={use_real_unbind_dim}` but should be -1 or -2."
+            )
 
         out = (x.float() * cos + x_rotated.float() * sin).to(x.dtype)
 
@@ -136,13 +159,19 @@ def apply_rotary_emb_qwen(
 class QwenImage21TemporalTimesteps(nn.Module):
     r"""Sinusoidal timestep embedding. `cos` occupies the first half of the channels and `sin` the second."""
 
-    def __init__(self, timestep_dim: int, max_period: int = 10000, time_factor: float = 1000.0):
+    def __init__(
+        self, timestep_dim: int, max_period: int = 10000, time_factor: float = 1000.0
+    ):
         super().__init__()
         self.timestep_dim = timestep_dim
         self.time_factor = time_factor
 
         half = timestep_dim // 2
-        freqs = torch.exp(-math.log(max_period) * torch.arange(start=0, end=half, dtype=torch.float32) / half)
+        freqs = torch.exp(
+            -math.log(max_period)
+            * torch.arange(start=0, end=half, dtype=torch.float32)
+            / half
+        )
         self.register_buffer("freqs", freqs, persistent=False)
 
     def forward(self, timestep: torch.Tensor) -> torch.Tensor:
@@ -150,7 +179,9 @@ class QwenImage21TemporalTimesteps(nn.Module):
         args = timestep[:, None] * self.freqs[None].to(timestep.device)
         embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
         if self.timestep_dim % 2:
-            embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
+            embedding = torch.cat(
+                [embedding, torch.zeros_like(embedding[:, :1])], dim=-1
+            )
         return embedding.to(timestep.dtype)
 
 
@@ -162,7 +193,9 @@ class QwenImage21TimestepProjEmbeddings(nn.Module):
             in_channels=256, time_embed_dim=embedding_dim, sample_proj_bias=False
         )
 
-    def forward(self, timestep: torch.Tensor, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, timestep: torch.Tensor, hidden_states: torch.Tensor
+    ) -> torch.Tensor:
         timesteps_proj = self.time_proj(timestep)
         return self.timestep_embedder(timesteps_proj.to(dtype=hidden_states.dtype))
 
@@ -181,7 +214,9 @@ class QwenImage21ZeroCenterRMSNorm(nn.Module):
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         input_dtype = hidden_states.dtype
         hidden_states = hidden_states.float()
-        rrms = torch.rsqrt(torch.mean(hidden_states**2, dim=-1, keepdim=True) + self.eps)
+        rrms = torch.rsqrt(
+            torch.mean(hidden_states**2, dim=-1, keepdim=True) + self.eps
+        )
         return (hidden_states * rrms * (self.weight.float() + 1)).to(input_dtype)
 
 
@@ -201,15 +236,19 @@ class QwenImage21TextProjection(nn.Module):
 
 
 class QwenImage21SwiGLUFeedForward(nn.Module):
+    r"""SwiGLU with the gate and up projections fused into one GEMM, the layout
+    the ComfyUI checkpoints ship: `gate_up.weight` is `[gate_layer; proj]`
+    concatenated on the out dim."""
+
     def __init__(self, hidden_size: int, mlp_hidden_size: int):
         super().__init__()
-        self.proj = nn.Linear(hidden_size, mlp_hidden_size, bias=False)
+        self.gate_up = nn.Linear(hidden_size, 2 * mlp_hidden_size, bias=False)
         self.out = nn.Linear(mlp_hidden_size, hidden_size, bias=False)
-        self.gate_layer = nn.Linear(hidden_size, mlp_hidden_size, bias=False)
         self.activation_fn = nn.SiLU()
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        return self.out(self.activation_fn(self.gate_layer(hidden_states)) * self.proj(hidden_states))
+        gate, up = self.gate_up(hidden_states).chunk(2, dim=-1)
+        return self.out(self.activation_fn(gate) * up)
 
 
 class QwenImage21AdaLayerNormContinuous(nn.Module):
@@ -218,11 +257,15 @@ class QwenImage21AdaLayerNormContinuous(nn.Module):
     embedding_dim`.
     """
 
-    def __init__(self, embedding_dim: int, conditioning_embedding_dim: int, eps: float = 1e-6):
+    def __init__(
+        self, embedding_dim: int, conditioning_embedding_dim: int, eps: float = 1e-6
+    ):
         super().__init__()
         self.silu = nn.SiLU()
         self.linear = nn.Linear(conditioning_embedding_dim, embedding_dim, bias=False)
-        self.norm = nn.LayerNorm(embedding_dim, eps, elementwise_affine=False, bias=False)
+        self.norm = nn.LayerNorm(
+            embedding_dim, eps, elementwise_affine=False, bias=False
+        )
 
     def forward(
         self,
@@ -235,7 +278,9 @@ class QwenImage21AdaLayerNormContinuous(nn.Module):
         return self.norm(hidden_states) * (1 + scale)
 
 
-def _select_modulation_rows(params: torch.Tensor, target_token_mask: torch.Tensor | None) -> torch.Tensor:
+def _select_modulation_rows(
+    params: torch.Tensor, target_token_mask: torch.Tensor | None
+) -> torch.Tensor:
     r"""
     Broadcast per-sample modulation `params` over the token axis.
 
@@ -284,9 +329,15 @@ def build_qwenimage21_block_causal_mask(
 
     image_ids = F.pad(image_ids, (0, padded_seq_len - seq_len), value=-1)
     if encoder_hidden_states_mask is None:
-        key_valid = torch.ones(batch_size, padded_seq_len, dtype=torch.bool, device=device)
+        key_valid = torch.ones(
+            batch_size, padded_seq_len, dtype=torch.bool, device=device
+        )
     else:
-        key_valid = F.pad(encoder_hidden_states_mask.bool(), (0, padded_seq_len - seq_len), value=False)
+        key_valid = F.pad(
+            encoder_hidden_states_mask.bool(),
+            (0, padded_seq_len - seq_len),
+            value=False,
+        )
 
     def mask_mod(batch_idx, head_idx, q_idx, kv_idx):
         is_padding = (q_idx >= seq_len) | (kv_idx >= seq_len)
@@ -306,7 +357,9 @@ def build_qwenimage21_block_causal_mask(
     )
 
 
-def _qwenimage21_prefix_segments(image_ids: torch.Tensor, prefix_len: int) -> list[tuple[int, int, bool]]:
+def _qwenimage21_prefix_segments(
+    image_ids: torch.Tensor, prefix_len: int
+) -> list[tuple[int, int, bool]]:
     """Split the prefix into `(start, end, is_text)` runs of equal `image_ids`.
 
     This is the block-causal structure in the form [`QwenImage21AttnProcessor`] consumes it, the way
@@ -402,7 +455,12 @@ class QwenImage21FlexAttnProcessor:
         key_valid: torch.Tensor | None = None,
     ) -> torch.Tensor:
         query, key, value, seq_len_q = _qwenimage21_prepare_qkv(
-            attn, hidden_states, rotary_emb, layer_cache, kv_cache_mode, cache_write_slice
+            attn,
+            hidden_states,
+            rotary_emb,
+            layer_cache,
+            kv_cache_mode,
+            cache_write_slice,
         )
 
         seq_len_kv = key.shape[1]
@@ -414,7 +472,9 @@ class QwenImage21FlexAttnProcessor:
             if (
                 not self._warned_uncompiled
                 and not torch.compiler.is_compiling()
-                and not hasattr(flex_attention_module.flex_attention, "_torchdynamo_orig_callable")
+                and not hasattr(
+                    flex_attention_module.flex_attention, "_torchdynamo_orig_callable"
+                )
             ):
                 logger.warning(
                     "`QwenImage21FlexAttnProcessor` is running an uncompiled `flex_attention`, which materializes the "
@@ -422,8 +482,14 @@ class QwenImage21FlexAttnProcessor:
                     "model with `transformer.compile()`, or switch to `QwenImage21AttnProcessor`."
                 )
                 QwenImage21FlexAttnProcessor._warned_uncompiled = True
-            pad_q = int(math.ceil(seq_len_q / _FLEX_BLOCK_SIZE) * _FLEX_BLOCK_SIZE) - seq_len_q
-            pad_kv = int(math.ceil(seq_len_kv / _FLEX_BLOCK_SIZE) * _FLEX_BLOCK_SIZE) - seq_len_kv
+            pad_q = (
+                int(math.ceil(seq_len_q / _FLEX_BLOCK_SIZE) * _FLEX_BLOCK_SIZE)
+                - seq_len_q
+            )
+            pad_kv = (
+                int(math.ceil(seq_len_kv / _FLEX_BLOCK_SIZE) * _FLEX_BLOCK_SIZE)
+                - seq_len_kv
+            )
             # Pad the sequence axis. `F.pad` counts from the last dimension, so the head and channel axes are
             # padded by zero first. The result stays contiguous, which the compiled flex kernel requires.
             if pad_q:
@@ -484,7 +550,12 @@ class QwenImage21AttnProcessor:
         key_valid: torch.Tensor | None = None,
     ) -> torch.Tensor:
         query, key, value, seq_len_q = _qwenimage21_prepare_qkv(
-            attn, hidden_states, rotary_emb, layer_cache, kv_cache_mode, cache_write_slice
+            attn,
+            hidden_states,
+            rotary_emb,
+            layer_cache,
+            kv_cache_mode,
+            cache_write_slice,
         )
 
         if segments is None:
@@ -510,14 +581,27 @@ class QwenImage21AttnProcessor:
                     seg_len = end - start
                     seg_mask = torch.cat(
                         [
-                            torch.ones(seg_len, start, dtype=torch.bool, device=query.device),
-                            torch.tril(torch.ones(seg_len, seg_len, dtype=torch.bool, device=query.device)),
+                            torch.ones(
+                                seg_len, start, dtype=torch.bool, device=query.device
+                            ),
+                            torch.tril(
+                                torch.ones(
+                                    seg_len,
+                                    seg_len,
+                                    dtype=torch.bool,
+                                    device=query.device,
+                                )
+                            ),
                         ],
                         dim=1,
                     )[None, None]
                 if key_valid is not None:
                     seg_key_valid = key_valid[:, None, None, :end]
-                    seg_mask = seg_key_valid if seg_mask is None else (seg_mask & seg_key_valid)
+                    seg_mask = (
+                        seg_key_valid
+                        if seg_mask is None
+                        else (seg_mask & seg_key_valid)
+                    )
                 outputs.append(
                     dispatch_attention_fn(
                         query[:, start:end],
@@ -534,7 +618,9 @@ class QwenImage21AttnProcessor:
                     query[:, prefix_len:],
                     key,
                     value,
-                    attn_mask=None if key_valid is None else key_valid[:, None, None, :],
+                    attn_mask=None
+                    if key_valid is None
+                    else key_valid[:, None, None, :],
                     dropout_p=0.0,
                     backend=None,
                     parallel_config=self._parallel_config,
@@ -560,7 +646,14 @@ class QwenImage21Attention(torch.nn.Module, AttentionModuleMixin):
     _default_processor_cls = QwenImage21AttnProcessor
     _available_processors = [QwenImage21AttnProcessor, QwenImage21FlexAttnProcessor]
 
-    def __init__(self, dim: int, heads: int, dim_head: int, eps: float = 1e-6, processor: Any | None = None):
+    def __init__(
+        self,
+        dim: int,
+        heads: int,
+        dim_head: int,
+        eps: float = 1e-6,
+        processor: Any | None = None,
+    ):
         super().__init__()
         self.heads = heads
         self.inner_dim = heads * dim_head
@@ -570,11 +663,15 @@ class QwenImage21Attention(torch.nn.Module, AttentionModuleMixin):
         self.to_q = nn.Linear(dim, self.inner_dim, bias=False)
         self.to_k = nn.Linear(dim, self.inner_dim, bias=False)
         self.to_v = nn.Linear(dim, self.inner_dim, bias=False)
-        self.to_out = nn.ModuleList([nn.Linear(self.inner_dim, dim, bias=False), nn.Dropout(0.0)])
+        self.to_out = nn.ModuleList(
+            [nn.Linear(self.inner_dim, dim, bias=False), nn.Dropout(0.0)]
+        )
         self.norm_q = RMSNorm(dim_head, eps=eps)
         self.norm_k = RMSNorm(dim_head, eps=eps)
 
-        self.set_processor(processor if processor is not None else self._default_processor_cls())
+        self.set_processor(
+            processor if processor is not None else self._default_processor_cls()
+        )
 
     def forward(self, hidden_states: torch.Tensor, **kwargs) -> torch.Tensor:
         return self.processor(self, hidden_states, **kwargs)
@@ -597,9 +694,13 @@ class QwenImage21TransformerBlock(nn.Module):
     ):
         super().__init__()
         self.img_norm1 = nn.LayerNorm(dim, elementwise_affine=False, eps=eps)
-        self.attn = QwenImage21Attention(dim=dim, heads=num_attention_heads, dim_head=attention_head_dim, eps=eps)
+        self.attn = QwenImage21Attention(
+            dim=dim, heads=num_attention_heads, dim_head=attention_head_dim, eps=eps
+        )
         self.img_norm2 = nn.LayerNorm(dim, elementwise_affine=False, eps=eps)
-        self.img_mlp = QwenImage21SwiGLUFeedForward(hidden_size=dim, mlp_hidden_size=dim * mlp_ratio)
+        self.img_mlp = QwenImage21SwiGLUFeedForward(
+            hidden_size=dim, mlp_hidden_size=dim * mlp_ratio
+        )
 
     def _modulate(
         self,
@@ -627,7 +728,9 @@ class QwenImage21TransformerBlock(nn.Module):
     ) -> torch.Tensor:
         mod1, mod2 = modulation.chunk(2, dim=-1)
 
-        img_modulated, img_gate1 = self._modulate(self.img_norm1(hidden_states), mod1, target_token_mask)
+        img_modulated, img_gate1 = self._modulate(
+            self.img_norm1(hidden_states), mod1, target_token_mask
+        )
         attn_output = self.attn(
             hidden_states=img_modulated,
             attention_mask=attention_mask,
@@ -640,7 +743,9 @@ class QwenImage21TransformerBlock(nn.Module):
         )
         hidden_states = hidden_states + img_gate1.tanh() * attn_output
 
-        img_modulated2, img_gate2 = self._modulate(self.img_norm2(hidden_states), mod2, target_token_mask)
+        img_modulated2, img_gate2 = self._modulate(
+            self.img_norm2(hidden_states), mod2, target_token_mask
+        )
         hidden_states = hidden_states + img_gate2.tanh() * self.img_mlp(img_modulated2)
 
         if hidden_states.dtype == torch.float16:
@@ -666,16 +771,30 @@ class QwenImage21Rope(nn.Module):
         pos_index = torch.arange(8192)
         neg_index = torch.arange(1024).flip(0) * -1 - 1
         self.freqs = [
-            torch.cat([self.rope_params(pos_index, dim, theta), self.rope_params(neg_index, dim, theta)], dim=0)
+            torch.cat(
+                [
+                    self.rope_params(pos_index, dim, theta),
+                    self.rope_params(neg_index, dim, theta),
+                ],
+                dim=0,
+            )
             for dim in axes_dim
         ]
 
-    def rope_params(self, index: torch.Tensor, dim: int, theta: int = 10000) -> torch.Tensor:
-        freqs = torch.outer(index, 1.0 / torch.pow(theta, torch.arange(0, dim, 2).to(torch.float32).div(dim)))
+    def rope_params(
+        self, index: torch.Tensor, dim: int, theta: int = 10000
+    ) -> torch.Tensor:
+        freqs = torch.outer(
+            index,
+            1.0 / torch.pow(theta, torch.arange(0, dim, 2).to(torch.float32).div(dim)),
+        )
         return torch.polar(torch.ones_like(freqs), freqs)
 
     def forward(
-        self, img_shapes: list[tuple[int, int, int]], image_pad_mask: torch.Tensor, device: torch.device
+        self,
+        img_shapes: list[tuple[int, int, int]],
+        image_pad_mask: torch.Tensor,
+        device: torch.device,
     ) -> torch.Tensor:
         self.freqs = [freq.to(device) for freq in self.freqs]
 
@@ -695,8 +814,20 @@ class QwenImage21Rope(nn.Module):
             frame_index.extend([position] * (height * width))
             position += max(height, width)
 
-            image_height_index.extend([h for h in range(-(height - height // 2), height // 2) for _ in range(width)])
-            image_width_index.extend([w for _ in range(height) for w in range(-(width - width // 2), width // 2)])
+            image_height_index.extend(
+                [
+                    h
+                    for h in range(-(height - height // 2), height // 2)
+                    for _ in range(width)
+                ]
+            )
+            image_width_index.extend(
+                [
+                    w
+                    for _ in range(height)
+                    for w in range(-(width - width // 2), width // 2)
+                ]
+            )
 
         if cursor < total_len:
             frame_index.extend(range(position, position + total_len - cursor))
@@ -704,14 +835,31 @@ class QwenImage21Rope(nn.Module):
         frame_index = torch.tensor(frame_index, dtype=torch.long, device=device)
         height_index = frame_index.clone()
         width_index = frame_index.clone()
-        height_index[image_pad_mask] = torch.tensor(image_height_index, dtype=torch.long, device=device)
-        width_index[image_pad_mask] = torch.tensor(image_width_index, dtype=torch.long, device=device)
+        height_index[image_pad_mask] = torch.tensor(
+            image_height_index, dtype=torch.long, device=device
+        )
+        width_index[image_pad_mask] = torch.tensor(
+            image_width_index, dtype=torch.long, device=device
+        )
 
-        return torch.cat([self.freqs[0][frame_index], self.freqs[1][height_index], self.freqs[2][width_index]], dim=-1)
+        return torch.cat(
+            [
+                self.freqs[0][frame_index],
+                self.freqs[1][height_index],
+                self.freqs[2][width_index],
+            ],
+            dim=-1,
+        )
 
 
 class QwenImage21Transformer2DModel(
-    ModelMixin, ConfigMixin, PeftAdapterMixin, FromOriginalModelMixin, CacheMixin, AttentionMixin
+    ModelMixin,
+    ConfigMixin,
+    PeftAdapterMixin,
+    FromOriginalModelMixin,
+    CacheMixin,
+    AttentionMixin,
+    OstrisModelMixin,
 ):
     r"""
     The single-stream Transformer used by Qwen-Image 2.1.
@@ -759,6 +907,70 @@ class QwenImage21Transformer2DModel(
     _repeated_blocks = ["QwenImage21TransformerBlock"]
     _skip_keys = ["kv_cache"]
 
+    # ---- toolkit loading (OstrisModelMixin) ----
+    aitk_subfolder = "transformer"
+    aitk_config_repo = "Qwen/Qwen-Image-2.1"
+
+    aitk_comfy_repo = "Comfy-Org/Qwen-Image-2.1"
+    # convrot8 first: it is the toolkit's default qtype, and a matching
+    # pre-quantized file attaches as-is instead of paying a quantize pass.
+    # Registered under both repo ids so name_or_path can be either the comfy
+    # repack (the default) or the original repo.
+    _COMFY_FILES = [
+        "diffusion_models/qwen_image_2.1_int8_convrot.safetensors",
+        "diffusion_models/qwen_image_2.1_bf16.safetensors",
+    ]
+    aitk_comfy_weight_names = {
+        "Comfy-Org/Qwen-Image-2.1": _COMFY_FILES,
+        "Qwen/Qwen-Image-2.1": _COMFY_FILES,
+    }
+
+    @classmethod
+    def get_transformer_block_names(cls):
+        return ["transformer_blocks"]
+
+    @classmethod
+    def get_quantization_exclude_modules(cls):
+        # sensitive modules kept in full precision (fnmatch patterns on module
+        # names). These are exactly the ones the Comfy-Org int8_convrot file
+        # leaves in bf16, so the shipped quantization and a fresh one agree:
+        #   img_in           - latent input projection
+        #   txt_in*          - text feature -> model width projection
+        #   time_text_embed* - timestep embedder, feeds every block's modulation
+        #   modulation*      - the one shared modulation projection
+        #   norm_out* / proj_out - final modulated norm + output projection
+        return [
+            "img_in",
+            "txt_in*",
+            "time_text_embed*",
+            "modulation*",
+            "norm_out*",
+            "proj_out",
+        ]
+
+    @classmethod
+    def convert_state_dict_on_load(cls, state_dict):
+        """Accept the diffusers key layout (split `img_mlp.gate_layer`/`proj`)
+        as well as the comfy one this class uses natively (fused
+        `img_mlp.gate_up`). Comfy checkpoints pass straight through."""
+        if not any(k.endswith(".img_mlp.gate_layer.weight") for k in state_dict):
+            return state_dict
+
+        state_dict = dict(state_dict)
+        new_sd = {}
+        for key, value in state_dict.items():
+            if key.endswith(".img_mlp.gate_layer.weight"):
+                prefix = key[: -len(".gate_layer.weight")]
+                # gate first, matching the comfy [gate; up] concat order
+                new_sd[f"{prefix}.gate_up.weight"] = torch.cat(
+                    [value, state_dict[f"{prefix}.proj.weight"]], dim=0
+                )
+                continue
+            if key.endswith(".img_mlp.proj.weight"):
+                continue
+            new_sd[key] = value
+        return new_sd
+
     @register_to_config
     def __init__(
         self,
@@ -779,12 +991,18 @@ class QwenImage21Transformer2DModel(
         self.inner_dim = num_attention_heads * attention_head_dim
 
         self.pos_embed = QwenImage21Rope(theta=10000, axes_dim=list(axes_dims_rope))
-        self.time_text_embed = QwenImage21TimestepProjEmbeddings(embedding_dim=self.inner_dim)
+        self.time_text_embed = QwenImage21TimestepProjEmbeddings(
+            embedding_dim=self.inner_dim
+        )
         self.txt_in = QwenImage21TextProjection(context_in_dim, self.inner_dim, eps=eps)
-        self.img_in = nn.Linear(in_channels * patch_size * patch_size, self.inner_dim, bias=False)
+        self.img_in = nn.Linear(
+            in_channels * patch_size * patch_size, self.inner_dim, bias=False
+        )
 
         # One shared modulation for every block: [mod1.scale, mod1.gate, mod2.scale, mod2.gate].
-        self.modulation = nn.Sequential(nn.SiLU(), nn.Linear(self.inner_dim, 4 * self.inner_dim, bias=False))
+        self.modulation = nn.Sequential(
+            nn.SiLU(), nn.Linear(self.inner_dim, 4 * self.inner_dim, bias=False)
+        )
 
         self.transformer_blocks = nn.ModuleList(
             [
@@ -799,8 +1017,12 @@ class QwenImage21Transformer2DModel(
             ]
         )
 
-        self.norm_out = QwenImage21AdaLayerNormContinuous(self.inner_dim, self.inner_dim, eps=eps)
-        self.proj_out = nn.Linear(self.inner_dim, patch_size * patch_size * self.out_channels, bias=False)
+        self.norm_out = QwenImage21AdaLayerNormContinuous(
+            self.inner_dim, self.inner_dim, eps=eps
+        )
+        self.proj_out = nn.Linear(
+            self.inner_dim, patch_size * patch_size * self.out_channels, bias=False
+        )
 
         self.gradient_checkpointing = False
 
@@ -901,7 +1123,9 @@ class QwenImage21Transformer2DModel(
                 f"kv_cache_mode must be 'extract' or 'cached' when kv_cache is provided, got {kv_cache_mode!r}."
             )
         if kv_cache is None and kv_cache_mode is not None:
-            raise ValueError(f"kv_cache_mode is {kv_cache_mode!r} but no kv_cache was passed to hold the prefix.")
+            raise ValueError(
+                f"kv_cache_mode is {kv_cache_mode!r} but no kv_cache was passed to hold the prefix."
+            )
 
         hidden_states = self.img_in(hidden_states)
         encoder_hidden_states = self.txt_in(encoder_hidden_states)
@@ -915,15 +1139,21 @@ class QwenImage21Transformer2DModel(
         joint_hidden_states = torch.cat(
             [
                 encoder_hidden_states,
-                encoder_hidden_states.new_zeros(batch_size, target_tokens // 4, encoder_hidden_states.shape[2]),
+                encoder_hidden_states.new_zeros(
+                    batch_size, target_tokens // 4, encoder_hidden_states.shape[2]
+                ),
             ],
             dim=1,
         )
         joint_hidden_states = joint_hidden_states.repeat_interleave(repeats, dim=1)
         joint_hidden_states[:, image_pad_mask] = hidden_states
 
-        rotary_emb = self.pos_embed(img_shapes[0], image_pad_mask, device=hidden_states.device)
-        image_ids, target_token_mask = self.build_token_metadata(image_pad_mask, img_shapes[0])
+        rotary_emb = self.pos_embed(
+            img_shapes[0], image_pad_mask, device=hidden_states.device
+        )
+        image_ids, target_token_mask = self.build_token_metadata(
+            image_pad_mask, img_shapes[0]
+        )
 
         timestep = timestep.to(hidden_states.dtype)
         if self.config.causal_condition:
@@ -942,11 +1172,16 @@ class QwenImage21Transformer2DModel(
         joint_key_valid = None
         if encoder_hidden_states_mask is not None:
             joint_key_valid = torch.ones(
-                batch_size, image_pad_mask.shape[0], dtype=torch.bool, device=hidden_states.device
+                batch_size,
+                image_pad_mask.shape[0],
+                dtype=torch.bool,
+                device=hidden_states.device,
             )
             text_positions = (~image_pad_mask).nonzero(as_tuple=True)[0]
             vlm_text_positions = ~img_mask[0][: encoder_hidden_states_mask.shape[1]]
-            joint_key_valid[:, text_positions] = encoder_hidden_states_mask.bool()[:, vlm_text_positions]
+            joint_key_valid[:, text_positions] = encoder_hidden_states_mask.bool()[
+                :, vlm_text_positions
+            ]
 
         prefix_len = int((~target_token_mask).sum())
 
@@ -957,7 +1192,9 @@ class QwenImage21Transformer2DModel(
             joint_hidden_states = joint_hidden_states[:, prefix_len:]
             rotary_emb = rotary_emb[prefix_len:]
             modulation_mask = modulation_mask[prefix_len:]
-            attention_mask = None if joint_key_valid is None else joint_key_valid[:, None, None, :]
+            attention_mask = (
+                None if joint_key_valid is None else joint_key_valid[:, None, None, :]
+            )
             cache_write_slice = None
             block_segments, block_key_valid = None, None
         else:
@@ -965,22 +1202,34 @@ class QwenImage21Transformer2DModel(
             # installed processors read it — a flex `BlockMask`, per-segment boundaries, or both for a mixed set —
             # so neither path pays for building the other's metadata.
             processors = [block.attn.processor for block in self.transformer_blocks]
-            needs_block_mask = any(isinstance(processor, QwenImage21FlexAttnProcessor) for processor in processors)
+            needs_block_mask = any(
+                isinstance(processor, QwenImage21FlexAttnProcessor)
+                for processor in processors
+            )
             attention_mask = (
-                build_qwenimage21_block_causal_mask(image_ids, joint_key_valid, batch_size, hidden_states.device)
+                build_qwenimage21_block_causal_mask(
+                    image_ids, joint_key_valid, batch_size, hidden_states.device
+                )
                 if needs_block_mask
                 else None
             )
             block_segments = (
                 None
-                if all(isinstance(processor, QwenImage21FlexAttnProcessor) for processor in processors)
+                if all(
+                    isinstance(processor, QwenImage21FlexAttnProcessor)
+                    for processor in processors
+                )
                 else _qwenimage21_prefix_segments(image_ids, prefix_len)
             )
-            cache_write_slice = slice(0, prefix_len) if kv_cache_mode == "extract" else None
+            cache_write_slice = (
+                slice(0, prefix_len) if kv_cache_mode == "extract" else None
+            )
             block_key_valid = joint_key_valid
 
         for index_block, block in enumerate(self.transformer_blocks):
-            layer_cache = kv_cache.get_layer(index_block) if kv_cache is not None else None
+            layer_cache = (
+                kv_cache.get_layer(index_block) if kv_cache is not None else None
+            )
             if torch.is_grad_enabled() and self.gradient_checkpointing:
                 joint_hidden_states = self._gradient_checkpointing_func(
                     block,
