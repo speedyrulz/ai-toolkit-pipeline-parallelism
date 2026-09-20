@@ -90,6 +90,11 @@ class PipelineShardManager:
     ):
         if hasattr(module, "_shard_manager"):
             return module._shard_manager
+        if not block_names:
+            raise ValueError(
+                "pipeline sharding needs the model's transformer block names "
+                "(get_transformer_block_names returned nothing)"
+            )
         devices = [torch.device(d) for d in devices]
         if len(devices) < 2:
             raise ValueError(

@@ -106,6 +106,7 @@ export interface SaveConfig {
 }
 
 export interface DatasetConfig {
+  batch_size?: number;
   folder_path: string;
   mask_path: string | null;
   mask_min_value: number;
@@ -228,6 +229,7 @@ export interface SampleItem {
   sample_steps?: number;
   fps?: number;
   num_frames?: number;
+  duration?: number;
   ctrl_img?: string | null;
   ctrl_idx?: number;
   network_multiplier?: number;
@@ -251,6 +253,7 @@ export interface SampleConfig {
   sample_steps: number;
   num_frames: number;
   fps: number;
+  duration?: number;
 }
 
 export interface LoggingConfig {
@@ -300,6 +303,21 @@ export interface JobConfig {
   meta: MetaConfig;
 }
 
+// A LoRA published on the hub, offered for a specific model option. `path` is a
+// 'org/repo/path_to/file.safetensors' reference; the backend looks for it under
+// the models folder first and downloads it into MODELS_PATH/loras if missing.
+export interface CloudLora {
+  path: string;
+  name: string;
+  description?: string;
+}
+
+export interface CaptionLora {
+  path: string;
+  name: string;
+  strength: number;
+}
+
 export interface CaptionProcessConfig {
   type: string;
   sqlite_db_path?: string;
@@ -319,11 +337,15 @@ export interface CaptionProcessConfig {
     max_res?: number;
     max_new_tokens?: number;
     fixed_caption?: string;
+    caption_format?: string;
+    extract_vocals_before_transcribe?: boolean;
+    keep_timestamps?: boolean;
     caption_extension?: string;
     thinking?: boolean;
     batch_size?: number;
     layer_offloading?: boolean;
     layer_offloading_percent?: number;
+    loras?: CaptionLora[];
   }
 }
 

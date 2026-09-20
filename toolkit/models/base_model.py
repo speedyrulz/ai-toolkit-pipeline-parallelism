@@ -98,6 +98,12 @@ UNET_IN_CHANNELS = 4  # Stable Diffusion の in_channels は 4 で固定。XLも
 class BaseModel:
     # override these in child classes
     arch = None
+    # rename LoRA keys transformer. <-> diffusion_model. (the ComfyUI-standard
+    # prefix) on save/load
+    lora_keys_use_comfy_prefix = False
+    # text-generating models: the trainer runs train_llm_accumulation (model-owned
+    # loss via get_llm_loss) instead of the diffusion step; no vae / text encoder
+    is_llm = False
 
     def __init__(
             self,
@@ -164,6 +170,9 @@ class BaseModel:
         self.invert_assistant_lora = False
         self._after_sample_img_hooks = []
         self._status_update_hooks = []
+        # inference engine: called as hook(step_index, num_steps, latents)
+        # after every scheduler step while generating samples
+        self.sample_step_hook = None
         self.is_transformer = False
 
         self.sample_prompts_cache = None
@@ -180,6 +189,12 @@ class BaseModel:
         # control files may be VIDEOS (cached like dataset items, exposed on
         # the batch as control_video_latents_list); see minimax_h3 ref2va
         self.supports_video_control_images = False
+        # D-OPSD: cache per-item teacher text embeds (item's own media as reference 1)
+        self.dopsd_self_ref = False
+        # weight of the normal-target loss added alongside the D-OPSD teacher loss
+        self.dopsd_bleed_strength = 1.0
+        # forces cache_tensors_to_disk on latent-caching datasets (BaseSDTrainProcess)
+        self.require_pixel_tensor_cache = False
         # control images will come in as a list for encoding some things if true
         self.has_multiple_control_images = False
         # do not resize control images
@@ -268,6 +283,28 @@ class BaseModel:
     @property
     def text_embedding_space_version(self):
         return self.arch
+
+    def get_latent_space_version(self) -> str:
+        """Latent cache key. Override to invalidate caches when model_kwargs change what gets cached."""
+        if self.model_config.latent_space_version is not None:
+            return self.model_config.latent_space_version
+        if self.latent_space_version is not None:
+            return self.latent_space_version
+        if self.is_xl:
+            return 'sdxl'
+        if self.is_v3:
+            return 'sd3'
+        if self.is_auraflow:
+            return 'sdxl'
+        if self.is_flux:
+            return 'flux1'
+        if self.model_config.is_pixart_sigma:
+            return 'sdxl'
+        return self.model_config.arch
+
+    def get_text_embedding_space_version(self) -> str:
+        """Text embedding cache key. Override like get_latent_space_version."""
+        return self.text_embedding_space_version
 
     def get_bucket_divisibility(self):
         if self.vae is None:
@@ -392,6 +429,18 @@ class BaseModel:
     def add_status_update_hook(self, func):
         self._status_update_hooks.append(func)
 
+    def _emit_sample_step(self, latents, step_index=None, num_steps=None):
+        """For holders whose sampling loop bypasses scheduler.step: report one
+        denoised latent to sample_step_hook (no-op when unset)."""
+        from toolkit.sample_step_hook import emit_sample_step
+
+        emit_sample_step(self, latents, step_index, num_steps)
+
+    def _install_sample_step_hooks(self, pipeline):
+        from toolkit.sample_step_hook import install_sample_step_hooks
+
+        return install_sample_step_hooks(self, pipeline)
+
     @torch.no_grad()
     def generate_images(
             self,
@@ -447,6 +496,8 @@ class BaseModel:
                 pipeline.set_progress_bar_config(disable=True)
             except:
                 pass
+
+        unwrap_step_hooks = self._install_sample_step_hooks(pipeline)
 
         start_multiplier = 1.0
         if network is not None:
@@ -508,6 +559,7 @@ class BaseModel:
 
                     if network is not None:
                         network.multiplier = gen_config.network_multiplier
+                    self._sample_step_index = 0
                     torch.manual_seed(gen_config.seed)
                     torch.cuda.manual_seed(gen_config.seed)
 
@@ -541,7 +593,11 @@ class BaseModel:
                             quad_count=4
                         )
 
-                    if self.sample_prompts_cache is not None:
+                    if self.is_llm:
+                        # text-generating models take the prompt and media directly
+                        conditional_embeds = None
+                        unconditional_embeds = None
+                    elif self.sample_prompts_cache is not None:
                         conditional_embeds = self.sample_prompts_cache[i]['conditional'].to(self.device_torch, dtype=self.torch_dtype)
                         unconditional_embeds = self.sample_prompts_cache[i]['unconditional'].to(self.device_torch, dtype=self.torch_dtype)
                     else:
@@ -694,10 +750,12 @@ class BaseModel:
                             raise ValueError(
                                 "Refiner is only supported for XL models")
 
-                    conditional_embeds = conditional_embeds.to(
-                        self.device_torch, dtype=self.unet.dtype)
-                    unconditional_embeds = unconditional_embeds.to(
-                        self.device_torch, dtype=self.unet.dtype)
+                    if conditional_embeds is not None:
+                        conditional_embeds = conditional_embeds.to(
+                            self.device_torch, dtype=self.unet.dtype)
+                    if unconditional_embeds is not None:
+                        unconditional_embeds = unconditional_embeds.to(
+                            self.device_torch, dtype=self.unet.dtype)
 
                     img = self.generate_single_image(
                         pipeline,
@@ -716,6 +774,7 @@ class BaseModel:
                 if self.adapter is not None and isinstance(self.adapter, ReferenceAdapter):
                     self.adapter.clear_memory()
 
+        unwrap_step_hooks()
         # clear pipeline and cache to reduce vram usage
         del pipeline
         torch.cuda.empty_cache()
@@ -1423,7 +1482,7 @@ class BaseModel:
             'vae': {
                 'training': self.vae.training,
                 'device': self.vae.device,
-            },
+            } if self.vae is not None else None,
             'unet': {
                 'training': self.unet.training,
                 'device': self.unet.device,
@@ -1440,7 +1499,7 @@ class BaseModel:
                     # todo there has to be a better way to do this
                     'requires_grad': te_has_grad
                 })
-        else:
+        elif self.text_encoder is not None:
             te_has_grad = self.get_te_has_grad()
 
             self.device_state['text_encoder'] = {
@@ -1492,11 +1551,12 @@ class BaseModel:
         self.device_state = None
 
     def set_device_state(self, state):
-        if state['vae']['training']:
-            self.vae.train()
-        else:
-            self.vae.eval()
-        self.vae.to(state['vae']['device'])
+        if self.vae is not None and state.get('vae') is not None:
+            if state['vae']['training']:
+                self.vae.train()
+            else:
+                self.vae.eval()
+            self.vae.to(state['vae']['device'])
         if state['unet']['training']:
             self.unet.train()
         else:
@@ -1524,7 +1584,7 @@ class BaseModel:
                     encoder.to(state['text_encoder']['device'])
                     encoder.requires_grad_(
                         state['text_encoder']['requires_grad'])
-        else:
+        elif self.text_encoder is not None:
             if state['text_encoder']['training']:
                 self.text_encoder.train()
             else:
@@ -1618,15 +1678,95 @@ class BaseModel:
         if isinstance(self.text_encoder, list):
             for encoder in self.text_encoder:
                 encoder.to(*args, **kwargs)
-        else:
+        elif self.text_encoder is not None:
             self.text_encoder.to(*args, **kwargs)
-    
+
+    def component_load_kwargs(self, role: str = "transformer", dtype=None):
+        """kwargs for a v2 module's .load()/.aitk_post_load(), derived from
+        model_config: qtype (with the accuracy recovery adapter recombined),
+        offload fraction, devices, low_vram placement. Roles: "transformer",
+        "te", "vae"."""
+        mc = self.model_config
+        qtype, offload = None, 0.0
+        if role == "transformer":
+            if mc.quantize:
+                qtype = mc.qtype
+                if mc.accuracy_recovery_adapter and "|" not in (qtype or ""):
+                    qtype = f"{qtype}|{mc.accuracy_recovery_adapter}"
+            if mc.layer_offloading:
+                offload = mc.layer_offloading_transformer_percent
+        elif role == "te":
+            if mc.quantize_te:
+                qtype = mc.qtype_te
+            if mc.layer_offloading:
+                offload = mc.layer_offloading_text_encoder_percent
+        if dtype is None:
+            dtype = self.vae_torch_dtype if role == "vae" else self.torch_dtype
+        device = self.te_device_torch if role == "te" else self.device_torch
+        if mc.low_vram and role in ("transformer", "te"):
+            device = "cpu"
+        elif role == "vae":
+            device = self.vae_device_torch
+        # pipeline sharding (transformer only): split the repeated blocks over
+        # several gpus instead of placing the whole module on one. The primary
+        # (first) device must be the trainer's device — the model's output
+        # lands there and the loss math runs against tensors on it.
+        pipeline_devices = None
+        pipeline_balance = None
+        if role == "transformer" and getattr(mc, "pipeline_sharding", False):
+            _train_dev = torch.device(self.device_torch)
+            _train_idx = _train_dev.index if _train_dev.index is not None else 0
+            primary = f"cuda:{_train_idx}"
+            pipeline_devices = mc.pipeline_devices
+            if pipeline_devices is None:
+                pipeline_devices = [primary] + [
+                    f"cuda:{i}"
+                    for i in range(torch.cuda.device_count())
+                    if i != _train_idx
+                ]
+            else:
+                pipeline_devices = [str(torch.device(d)) for d in pipeline_devices]
+                if pipeline_devices[0] != primary:
+                    if primary in pipeline_devices:
+                        pipeline_devices.remove(primary)
+                    pipeline_devices.insert(0, primary)
+                    self.print_and_status_update(
+                        f"pipeline_devices reordered to {pipeline_devices}: the "
+                        f"trainer device ({primary}) must be the primary shard device"
+                    )
+            pipeline_balance = mc.pipeline_balance
+            # the shard attach does the placement; a whole-module move to one
+            # device would either OOM or be immediately undone
+            device = None
+
+        return dict(
+            qtype=qtype,
+            offload=offload,
+            dtype=dtype,
+            device=device,
+            quantize_device=self.device_torch,
+            base_model=self,
+            use_comfy_weights=mc.model_kwargs.get("use_comfy_weights", True),
+            pipeline_devices=pipeline_devices,
+            pipeline_balance=pipeline_balance,
+        )
+
     def convert_lora_weights_before_save(self, state_dict):
         # can be overridden in child classes to convert weights before saving
+        if self.lora_keys_use_comfy_prefix:
+            return {
+                k.replace("transformer.", "diffusion_model."): v
+                for k, v in state_dict.items()
+            }
         return state_dict
-    
+
     def convert_lora_weights_before_load(self, state_dict):
         # can be overridden in child classes to convert weights before loading
+        if self.lora_keys_use_comfy_prefix:
+            return {
+                k.replace("diffusion_model.", "transformer."): v
+                for k, v in state_dict.items()
+            }
         return state_dict
     
     def condition_noisy_latents(self, latents: torch.Tensor, batch:'DataLoaderBatchDTO'):
