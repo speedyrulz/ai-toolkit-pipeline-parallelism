@@ -106,6 +106,76 @@ class QwenImage21Transformer(_QwenImage21Transformer2DModel, OstrisModelMixin):
         return state_dict
 
 
+# maps the original (wan-style) VAE export's residual Sequential indices to
+# the diffusers resnet module names
+_VAE_RES_SEQ = {"0": "norm1", "2": "conv1", "3": "norm2", "6": "conv2"}
+
+
+def _convert_qi21_vae_key(k: str) -> str:
+    """Original/comfy Qwen-Image-2.1 VAE key -> current diffusers layout.
+
+    The Qwen and Comfy-Org exports carry the pre-rename module names
+    (conv1/conv2, downsamples/upsamples, residual Sequentials); diffusers main
+    renamed them to quant_conv/post_quant_conv, down_blocks/up_blocks with
+    resnets and a single (down/up)sampler. Verified as a 238/238 bijection
+    against both layouts."""
+    import re
+
+    if k.startswith("conv1."):
+        return k.replace("conv1.", "quant_conv.", 1)
+    if k.startswith("conv2."):
+        return k.replace("conv2.", "post_quant_conv.", 1)
+
+    m = re.match(r"^(encoder|decoder)\.(.*)$", k)
+    if not m:
+        return k
+    side, rest = m.groups()
+
+    if rest.startswith("conv1."):
+        return f"{side}.conv_in.{rest[len('conv1.'):]}"
+    if rest.startswith("conv2."):
+        return f"{side}.conv_out.{rest[len('conv2.'):]}"
+    m = re.match(r"^head\.(\d+)\.(.*)$", rest)
+    if m:
+        idx, tail = m.groups()
+        return f"{side}.norm_out.{tail}" if idx == "0" else f"{side}.conv_out.{tail}"
+
+    m = re.match(r"^middle\.(\d+)\.(.*)$", rest)
+    if m:
+        idx, tail = m.groups()
+        if idx == "1":
+            return f"{side}.mid_block.attentions.0.{tail}"
+        res_idx = 0 if idx == "0" else 1
+        m2 = re.match(r"^residual\.(\d+)\.(.*)$", tail)
+        if m2:
+            seq, leaf = m2.groups()
+            return f"{side}.mid_block.resnets.{res_idx}.{_VAE_RES_SEQ[seq]}.{leaf}"
+        return f"{side}.mid_block.resnets.{res_idx}.{tail}"
+
+    m = re.match(
+        r"^(?:downsamples|upsamples)\.(\d+)\.(?:downsamples|upsamples)\.(\d+)\.(.*)$",
+        rest,
+    )
+    if m:
+        outer, inner, tail = m.groups()
+        blocks = "down_blocks" if side == "encoder" else "up_blocks"
+        sampler = "downsampler" if side == "encoder" else "upsampler"
+        m2 = re.match(r"^residual\.(\d+)\.(.*)$", tail)
+        if m2:
+            seq, leaf = m2.groups()
+            return f"{side}.{blocks}.{outer}.resnets.{inner}.{_VAE_RES_SEQ[seq]}.{leaf}"
+        if tail.startswith("shortcut."):
+            return (
+                f"{side}.{blocks}.{outer}.resnets.{inner}.conv_shortcut."
+                f"{tail[len('shortcut.'):]}"
+            )
+        if tail.startswith("resample.") or tail.startswith("time_conv."):
+            # resample/time_conv sit after the resnets in the old flat list;
+            # their inner index collapses into the block's single sampler
+            return f"{side}.{blocks}.{outer}.{sampler}.{tail}"
+    return k
+
+
 class QwenImage21VAE(_AutoencoderKLQwenImage21, OstrisModelMixin):
     aitk_subfolder = "vae"
     aitk_config_repo = BASE_REPO
@@ -116,6 +186,35 @@ class QwenImage21VAE(_AutoencoderKLQwenImage21, OstrisModelMixin):
             "vae/qwen_image_2.1_vae_bf16.safetensors",
         ],
     }
+
+    @classmethod
+    def _load_single_file(
+        cls, file_path, dtype, config_path=None, config=None, subfolder=None, **kwargs
+    ):
+        from safetensors.torch import load_file
+
+        cls._readahead(file_path)
+        state_dict = load_file(file_path)
+        if not any(k.startswith("encoder.conv_in.") for k in state_dict):
+            # original/comfy export: rename, then reshape against the module
+            # (some Conv3d(1,3,3) became Conv2d(3,3) in the rename)
+            state_dict = {
+                _convert_qi21_vae_key(k): v for k, v in state_dict.items()
+            }
+        if config is None:
+            config = cls._load_single_file_config(config_path, subfolder)
+        model = cls.aitk_from_config(config)
+        target = dict(model.state_dict())
+        for k, v in list(state_dict.items()):
+            t = target.get(k)
+            if t is not None and t.shape != v.shape and t.numel() == v.numel():
+                v = v.reshape(t.shape)
+            if v.is_floating_point():
+                v = v.to(dtype)
+            state_dict[k] = v
+        model.load_state_dict(state_dict, assign=True)
+        model.to(dtype)
+        return model
 
 
 class QwenImage21Model(BaseModel):
@@ -209,7 +308,12 @@ class QwenImage21Model(BaseModel):
         self.print_and_status_update("Loading Qwen-Image-2.1 VAE")
         vae_path = self.model_config.model_kwargs.get("vae_path", components_path)
         vae = QwenImage21VAE.load_model(
-            vae_path, dtype=self.vae_torch_dtype, token=HF_TOKEN
+            vae_path,
+            dtype=self.vae_torch_dtype,
+            token=HF_TOKEN,
+            use_comfy_weights=self.model_config.model_kwargs.get(
+                "use_comfy_weights", True
+            ),
         )
         vae.eval()
         vae.requires_grad_(False)
