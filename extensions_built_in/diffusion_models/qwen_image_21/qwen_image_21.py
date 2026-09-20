@@ -300,6 +300,11 @@ class QwenImage21Model(BaseModel):
             processor = AutoProcessor.from_pretrained(te_path, token=HF_TOKEN)
         # t2i training only encodes text; the vision tower is dead weight
         text_encoder.drop_vision_tower()
+        # conditioning reads hidden states, never logits: the lm_head would
+        # otherwise hold (and, quantized, re-materialize per forward) a
+        # full-vocab 1.2 GB weight
+        if hasattr(text_encoder, "lm_head"):
+            text_encoder.lm_head = torch.nn.Identity()
         text_encoder.eval()
         text_encoder.requires_grad_(False)
         text_encoder.aitk_post_load(**self.component_load_kwargs("te"))
