@@ -400,6 +400,26 @@ export const AI_TOOLKIT_UI_MODELS: ModelArch[] = [
     },
   },
   {
+    name: "qwen_image_21",
+    label: "Qwen-Image-2.1",
+    group: "image",
+    defaults: {
+      // default updates when [selected, unselected] in the UI
+      "config.process[0].model.name_or_path": [
+        "Qwen/Qwen-Image-2.1",
+        defaultNameOrPath,
+      ],
+      "config.process[0].model.quantize": [true, false],
+      "config.process[0].model.quantize_te": [true, false],
+      "config.process[0].sample.sampler": ["flowmatch", "flowmatch"],
+      "config.process[0].train.noise_scheduler": ["flowmatch", "flowmatch"],
+      "config.process[0].train.timestep_type": ["weighted", "sigmoid"],
+      "config.process[0].model.qtype": ["qfloat8", "qfloat8"],
+    },
+    disableSections: ["network.conv"],
+    additionalSections: ["model.low_vram", "model.layer_offloading"],
+  },
+  {
     name: "qwen_image:2512",
     label: "Qwen-Image-2512",
     group: "image",
