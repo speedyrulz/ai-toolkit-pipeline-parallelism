@@ -1888,9 +1888,9 @@ class BaseSDTrainProcess(BaseTrainProcess):
 
         # first validation (nothing trained inside a tracked segment yet)
         if segment is None or len(segment['batches']) == 0:
-            self.validate()
+            loss = self.validate()
             self._alr_begin_segment()
-            return
+            return loss
 
         base_lr = float(self._alr_current_lr)
         candidates = self._alr_candidate_lrs(base_lr)
@@ -1937,6 +1937,32 @@ class BaseSDTrainProcess(BaseTrainProcess):
 
         self._alr_cleanup_batches(segment['batches'])
         self._alr_begin_segment()
+        return best['loss']
+
+    def _early_stop_check(self, val_loss) -> bool:
+        """Track the best validation loss; True when early_stop_patience
+        consecutive validations have passed without a new best."""
+        vc = self.train_config.validation_config
+        if vc is None or not vc.early_stop_patience or val_loss is None:
+            return False
+        best = getattr(self, '_val_best_loss', None)
+        if best is None or val_loss < best - vc.early_stop_min_delta:
+            self._val_best_loss = val_loss
+            self._val_no_improve = 0
+            return False
+        self._val_no_improve = getattr(self, '_val_no_improve', 0) + 1
+        print_acc(
+            f"early stop: no improvement {self._val_no_improve}/{vc.early_stop_patience} "
+            f"(val loss {val_loss:.5f}, best {best:.5f})"
+        )
+        if self._val_no_improve >= vc.early_stop_patience:
+            print_acc(
+                f"early stop: validation loss has not improved for "
+                f"{vc.early_stop_patience} validations, ending training at step "
+                f"{self.step_num} (best val loss {best:.5f})"
+            )
+            return True
+        return False
 
     def run(self):
         # torch.autograd.set_detect_anomaly(True)
@@ -2901,9 +2927,12 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 if is_validate_step:
                     with self.timer('validate'):
                         if self._alr_active():
-                            self._alr_validate_and_adapt()
+                            last_val_loss = self._alr_validate_and_adapt()
                         else:
-                            self.validate()
+                            last_val_loss = self.validate()
+                    if self._early_stop_check(last_val_loss):
+                        # the post-loop code saves the final state
+                        break
 
             if not did_first_flush:
                 flush()

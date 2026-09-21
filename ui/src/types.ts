@@ -156,6 +156,8 @@ export interface ValidationConfig {
   adaptive_lr_factor?: number;
   adaptive_lr_min?: number;
   adaptive_lr_max?: number;
+  early_stop_patience?: number;
+  early_stop_min_delta?: number;
 }
 
 export interface TrainConfig {

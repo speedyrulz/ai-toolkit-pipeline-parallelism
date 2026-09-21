@@ -376,6 +376,15 @@ class ValidationConfig:
             if not 1 <= self.adaptive_lr_count <= 5:
                 raise ValueError("adaptive_lr_count must be between 1 and 5")
 
+        # early stopping: end training (with a final save) after this many
+        # consecutive validations without a new best validation loss. 0
+        # disables. min_delta is how much lower than the best a loss must be
+        # to count as an improvement (guards against noise-level "bests").
+        self.early_stop_patience: int = int(kwargs.get('early_stop_patience', 0))
+        self.early_stop_min_delta: float = float(kwargs.get('early_stop_min_delta', 0.0))
+        if self.early_stop_patience < 0:
+            raise ValueError("early_stop_patience must be >= 0")
+
 
 class EmbeddingConfig:
     def __init__(self, **kwargs):

@@ -1055,6 +1055,30 @@ export default function SimpleJob({
                       ]}
                     />
                   </div>
+                  <div className="mt-4 grid grid-cols-1 md:grid-cols-3 gap-6">
+                    <NumberInput
+                      label="Early Stop Patience"
+                      value={validationConfig.early_stop_patience ?? 0}
+                      onChange={value =>
+                        setJobConfig(value, 'config.process[0].train.validation_config.early_stop_patience')
+                      }
+                      placeholder="0 = off"
+                      min={0}
+                    />
+                    <NumberInput
+                      label="Early Stop Min Delta"
+                      value={validationConfig.early_stop_min_delta ?? 0}
+                      onChange={value =>
+                        setJobConfig(value, 'config.process[0].train.validation_config.early_stop_min_delta')
+                      }
+                      placeholder="eg. 0"
+                      min={0}
+                    />
+                    <div className="text-sm text-gray-400 self-center">
+                      Stop training (with a final save) after this many validations in a row without a new best
+                      validation loss. Min delta is how much lower a loss must be to count as an improvement.
+                    </div>
+                  </div>
                   <div className="mt-4">
                     <Checkbox
                       label="Adaptive Learning Rate"
