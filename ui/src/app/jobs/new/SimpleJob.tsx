@@ -1056,6 +1056,73 @@ export default function SimpleJob({
                     />
                   </div>
                   <div className="mt-4">
+                    <Checkbox
+                      label="Adaptive Learning Rate"
+                      checked={!!validationConfig.adaptive_lr}
+                      onChange={value => {
+                        setJobConfig(value, 'config.process[0].train.validation_config.adaptive_lr');
+                        if (value) {
+                          if (validationConfig.adaptive_lr_count == null) {
+                            setJobConfig(3, 'config.process[0].train.validation_config.adaptive_lr_count');
+                          }
+                          if (validationConfig.adaptive_lr_factor == null) {
+                            setJobConfig(1.5, 'config.process[0].train.validation_config.adaptive_lr_factor');
+                          }
+                        }
+                      }}
+                    />
+                    {!!validationConfig.adaptive_lr && (
+                      <>
+                        <p className="text-sm text-gray-400 mt-2 mb-4">
+                          Every stretch of steps between validations is re-run from a snapshot at neighboring learning
+                          rates on the same batches and noise; the run with the lowest validation loss is kept and its
+                          learning rate becomes the new base. Training compute scales with the number of learning
+                          rates (3 learning rates = ~3x training time). Works best with a standard optimizer like
+                          adamw8bit; automagic optimizers already adapt their own learning rates. Not compatible with
+                          EMA. Saving mid-segment can capture a trajectory that is later rolled back, so keep Save
+                          Every a multiple of Validate Every.
+                        </p>
+                        <div className="grid grid-cols-1 md:grid-cols-4 gap-6">
+                          <NumberInput
+                            label="Learning Rates"
+                            value={validationConfig.adaptive_lr_count ?? 3}
+                            onChange={value =>
+                              setJobConfig(value, 'config.process[0].train.validation_config.adaptive_lr_count')
+                            }
+                            placeholder="eg. 3"
+                            min={1}
+                            max={5}
+                          />
+                          <NumberInput
+                            label="LR Step Factor"
+                            value={validationConfig.adaptive_lr_factor ?? 1.5}
+                            onChange={value =>
+                              setJobConfig(value, 'config.process[0].train.validation_config.adaptive_lr_factor')
+                            }
+                            placeholder="eg. 1.5"
+                            min={1.01}
+                          />
+                          <NumberInput
+                            label="Min LR"
+                            value={validationConfig.adaptive_lr_min ?? 0.000001}
+                            onChange={value =>
+                              setJobConfig(value, 'config.process[0].train.validation_config.adaptive_lr_min')
+                            }
+                            placeholder="eg. 0.000001"
+                          />
+                          <NumberInput
+                            label="Max LR"
+                            value={validationConfig.adaptive_lr_max ?? 0.01}
+                            onChange={value =>
+                              setJobConfig(value, 'config.process[0].train.validation_config.adaptive_lr_max')
+                            }
+                            placeholder="eg. 0.01"
+                          />
+                        </div>
+                      </>
+                    )}
+                  </div>
+                  <div className="mt-4">
                     <label className="block text-xs text-gray-300 mb-2">
                       Validation Images ({validationConfig.validation_items.length})
                     </label>

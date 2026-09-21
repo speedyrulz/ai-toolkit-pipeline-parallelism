@@ -356,6 +356,26 @@ class ValidationConfig:
         self.validate_every_n_steps: int = kwargs.get('validate_every_n_steps', 10)
         self.validation_sigmas: List[float] = kwargs.get('validation_sigmas', [1.0, 0.75, 0.5, 0.25])
 
+        # adaptive learning rate: at every validation, the segment of steps
+        # since the previous validation is re-run from a snapshot at lr/factor
+        # and lr*factor on the SAME batches and rng, validation loss decides
+        # which of the three trajectories to keep, and its lr becomes the new
+        # base. Costs ~3x training compute.
+        self.adaptive_lr: bool = kwargs.get('adaptive_lr', False)
+        self.adaptive_lr_factor: float = float(kwargs.get('adaptive_lr_factor', 1.5))
+        self.adaptive_lr_min: float = float(kwargs.get('adaptive_lr_min', 1e-6))
+        self.adaptive_lr_max: float = float(kwargs.get('adaptive_lr_max', 1e-2))
+        # how many learning rates to trial per segment (including the current
+        # one): 3 -> {lr/f, lr, lr*f}, 5 -> {lr/f^2 ... lr*f^2}. Training
+        # compute scales linearly with this. 1 disables the branching (plain
+        # validation).
+        self.adaptive_lr_count: int = int(kwargs.get('adaptive_lr_count', 3))
+        if self.adaptive_lr:
+            if self.adaptive_lr_factor <= 1.0:
+                raise ValueError("adaptive_lr_factor must be > 1.0")
+            if not 1 <= self.adaptive_lr_count <= 5:
+                raise ValueError("adaptive_lr_count must be between 1 and 5")
+
 
 class EmbeddingConfig:
     def __init__(self, **kwargs):

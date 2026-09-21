@@ -1728,6 +1728,215 @@ class BaseSDTrainProcess(BaseTrainProcess):
         network.multiplier = start_multiplier
         if was_unet_training:
             self.sd.unet.train()
+        return val_loss.item()
+
+    # ------------------------------------------------------------------
+    # Adaptive learning rate (validation-driven branch search)
+    #
+    # Every validation segment (the steps between validations) is treated as a
+    # trial: it runs normally at the current lr, then is re-run twice from a
+    # snapshot taken at the segment start — once at lr/factor and once at
+    # lr*factor — on the SAME buffered batches with the SAME rng, so the only
+    # difference between the three trajectories is the learning rate. The
+    # trajectory with the lowest validation loss is kept, and its lr becomes
+    # the base for the next segment. Costs ~3x training compute.
+    # ------------------------------------------------------------------
+
+    def _alr_active(self) -> bool:
+        vc = self.train_config.validation_config
+        return (
+            vc is not None
+            and getattr(vc, 'adaptive_lr', False)
+            and self._validation_cache is not None
+        )
+
+    def _alr_capture_rng(self):
+        state = {
+            'python': random.getstate(),
+            'numpy': np.random.get_state(),
+            'torch': torch.get_rng_state(),
+            'grad_accum_step': self.grad_accumulation_step,
+            'is_grad_accum': self.is_grad_accumulation_step,
+        }
+        if torch.cuda.is_available():
+            state['cuda'] = torch.cuda.get_rng_state_all()
+        return state
+
+    def _alr_restore_rng(self, state):
+        random.setstate(state['python'])
+        np.random.set_state(state['numpy'])
+        torch.set_rng_state(state['torch'])
+        if 'cuda' in state:
+            torch.cuda.set_rng_state_all(state['cuda'])
+        self.grad_accumulation_step = state['grad_accum_step']
+        self.is_grad_accumulation_step = state['is_grad_accum']
+
+    @staticmethod
+    def _alr_clone_to_cpu(obj):
+        # deep-clone a state-dict-like structure, detaching tensors to cpu
+        if isinstance(obj, torch.Tensor):
+            return obj.detach().clone().to('cpu')
+        if isinstance(obj, dict):
+            return {k: BaseSDTrainProcess._alr_clone_to_cpu(v) for k, v in obj.items()}
+        if isinstance(obj, list):
+            return [BaseSDTrainProcess._alr_clone_to_cpu(v) for v in obj]
+        if isinstance(obj, tuple):
+            return tuple(BaseSDTrainProcess._alr_clone_to_cpu(v) for v in obj)
+        return copy.deepcopy(obj)
+
+    def _alr_capture_state(self):
+        """Snapshot everything a branch mutates: trainable params, optimizer,
+        lr scheduler, rng and accumulation counters."""
+        params = []
+        for group in self.optimizer.param_groups:
+            for p in group['params']:
+                params.append(p.detach().clone().to('cpu'))
+        return {
+            'params': params,
+            'optimizer': self._alr_clone_to_cpu(self.optimizer.state_dict()),
+            'scheduler': (
+                self._alr_clone_to_cpu(self.lr_scheduler.state_dict())
+                if self.lr_scheduler is not None else None
+            ),
+            'rng': self._alr_capture_rng(),
+        }
+
+    def _alr_restore_state(self, state):
+        i = 0
+        with torch.no_grad():
+            for group in self.optimizer.param_groups:
+                for p in group['params']:
+                    p.data.copy_(state['params'][i].to(p.device, p.dtype))
+                    i += 1
+        self.optimizer.load_state_dict(copy.deepcopy(state['optimizer']))
+        if state['scheduler'] is not None and self.lr_scheduler is not None:
+            self.lr_scheduler.load_state_dict(copy.deepcopy(state['scheduler']))
+        self._alr_restore_rng(state['rng'])
+        self.optimizer.zero_grad(set_to_none=True)
+
+    def _alr_scale_lr(self, ratio: float):
+        """Multiply every learning rate the run consults by ratio: optimizer
+        group lrs, the scheduler's base_lrs (torch schedulers recompute group
+        lr from them every step), and any per-parameter adaptive lr state
+        (automagic-family optimizers)."""
+        for group in self.optimizer.param_groups:
+            if 'lr' in group:
+                group['lr'] = group['lr'] * ratio
+            if 'initial_lr' in group:
+                group['initial_lr'] = group['initial_lr'] * ratio
+        sched = self.lr_scheduler
+        if sched is not None and hasattr(sched, 'base_lrs'):
+            sched.base_lrs = [lr * ratio for lr in sched.base_lrs]
+        # automagic-family: the group lr is only the starting point; the live
+        # lr lives in per-param state tensors
+        for p, st in getattr(self.optimizer, 'state', {}).items():
+            if isinstance(st, dict) and isinstance(st.get('lr'), torch.Tensor):
+                st['lr'].mul_(ratio)
+
+    def _alr_begin_segment(self):
+        if not hasattr(self, '_alr_current_lr'):
+            self._alr_current_lr = float(self.train_config.lr)
+        self._alr_segment = {
+            'start': self._alr_capture_state(),
+            'batches': [],
+        }
+
+    def _alr_buffer_batches(self, batch_list):
+        # the step number rides along so replays see the same step-dependent
+        # behavior (step-scheduled timestep types etc.) the live segment saw
+        if getattr(self, '_alr_segment', None) is not None:
+            self._alr_segment['batches'].append((self.step_num, batch_list))
+
+    def _alr_cleanup_batches(self, batches):
+        for _, batch_list in batches:
+            for batch in batch_list:
+                if isinstance(batch, DataLoaderBatchDTO):
+                    batch.cleanup()
+
+    def _alr_replay_segment(self, batches):
+        """Re-run the buffered segment through the normal training hook."""
+        step_num_after = self.step_num
+        for step_num, batch_list in batches:
+            self.step_num = step_num
+            try:
+                with self.accelerator.accumulate(self.modules_being_trained):
+                    self.hook_train_loop(batch_list)
+            except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
+                if isinstance(e, RuntimeError) and "CUDA out of memory" not in str(e):
+                    raise
+                self.optimizer.zero_grad(set_to_none=True)
+                flush()
+        self.step_num = step_num_after
+
+    def _alr_candidate_lrs(self, base_lr: float):
+        """The alternate lrs to trial around base_lr: rings of the
+        multiplicative ladder, nearest first (lr/f, lr*f, lr/f^2, lr*f^2),
+        up to adaptive_lr_count - 1 alternates, clamped and deduped."""
+        vc = self.train_config.validation_config
+        f = vc.adaptive_lr_factor
+        exponents = [-1, 1, -2, 2][: max(vc.adaptive_lr_count - 1, 0)]
+        candidates = []
+        for e in exponents:
+            lr = min(max(base_lr * (f ** e), vc.adaptive_lr_min), vc.adaptive_lr_max)
+            if abs(lr - base_lr) / base_lr > 1e-9 and lr not in candidates:
+                candidates.append(lr)
+        return candidates
+
+    def _alr_validate_and_adapt(self):
+        """Called at every validation step in place of validate()."""
+        segment = getattr(self, '_alr_segment', None)
+
+        # first validation (nothing trained inside a tracked segment yet)
+        if segment is None or len(segment['batches']) == 0:
+            self.validate()
+            self._alr_begin_segment()
+            return
+
+        base_lr = float(self._alr_current_lr)
+        candidates = self._alr_candidate_lrs(base_lr)
+
+        if self.progress_bar is not None:
+            self.progress_bar.pause()
+
+        # branch 1 is the segment that just ran at base_lr
+        loss = self.validate()
+        best = {'loss': loss, 'lr': base_lr, 'state': self._alr_capture_state()}
+        branch_losses = {base_lr: loss}
+        print_acc(
+            f"adaptive lr: live segment @ {base_lr:.3e} -> val loss {loss:.5f}"
+        )
+
+        for lr in candidates:
+            self._alr_restore_state(segment['start'])
+            self._alr_scale_lr(lr / base_lr)
+            self._alr_replay_segment(segment['batches'])
+            loss = self.validate()
+            branch_losses[lr] = loss
+            print_acc(
+                f"adaptive lr: replayed segment @ {lr:.3e} -> val loss {loss:.5f}"
+            )
+            if loss < best['loss']:
+                best = {'loss': loss, 'lr': lr, 'state': self._alr_capture_state()}
+            # undo the scale relative to the restored start state so the next
+            # branch scales from base_lr again
+            self._alr_scale_lr(base_lr / lr)
+
+        # adopt the winning trajectory. Its optimizer/scheduler state dicts
+        # carry the winning lr, so no rescale is needed after the restore.
+        self._alr_restore_state(best['state'])
+        self._alr_current_lr = best['lr']
+        self.additional_logs['val/loss'] = best['loss']
+        self.additional_logs['val/lr'] = best['lr']
+        print_acc(
+            f"adaptive lr: continuing @ {best['lr']:.3e} "
+            f"(branches: {', '.join(f'{k:.3e}={v:.5f}' for k, v in branch_losses.items())})"
+        )
+
+        if self.progress_bar is not None:
+            self.progress_bar.unpause()
+
+        self._alr_cleanup_batches(segment['batches'])
+        self._alr_begin_segment()
 
     def run(self):
         # torch.autograd.set_detect_anomaly(True)
@@ -2541,6 +2750,21 @@ class BaseSDTrainProcess(BaseTrainProcess):
         start_step_num = self.step_num
         did_first_flush = False
         flush_next = False
+
+        if self._alr_active():
+            if self.ema is not None:
+                raise ValueError(
+                    "validation.adaptive_lr is not supported together with EMA: "
+                    "the ema state cannot be rolled back per branch"
+                )
+            vc = self.train_config.validation_config
+            print_acc(
+                f"Adaptive learning rate enabled: {vc.adaptive_lr_count} branches per "
+                f"segment (factor {vc.adaptive_lr_factor}), ~{vc.adaptive_lr_count}x "
+                "training compute"
+            )
+            self._alr_begin_segment()
+
         for step in range(start_step_num, self.train_config.steps):
             if self.train_config.do_paramiter_swapping:
                 self.optimizer.optimizer.swap_paramiters()
@@ -2611,6 +2835,9 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     batch_list.append(batch)
                     batch_step += 1
 
+                if self._alr_active():
+                    self._alr_buffer_batches(batch_list)
+
                 # setup accumulation
                 if self.train_config.gradient_accumulation_steps == -1:
                     # epoch is handling the accumulation, dont touch it
@@ -2673,7 +2900,10 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 )
                 if is_validate_step:
                     with self.timer('validate'):
-                        self.validate()
+                        if self._alr_active():
+                            self._alr_validate_and_adapt()
+                        else:
+                            self.validate()
 
             if not did_first_flush:
                 flush()
@@ -2709,7 +2939,9 @@ class BaseSDTrainProcess(BaseTrainProcess):
                         self.progress_bar.set_postfix_str(prog_bar_string)
 
                 # if the batch is a DataLoaderBatchDTO, then we need to clean it up
-                if isinstance(batch, DataLoaderBatchDTO):
+                # (adaptive lr owns its buffered batches and cleans them at
+                # segment end, so they stay replayable)
+                if isinstance(batch, DataLoaderBatchDTO) and not self._alr_active():
                     with self.timer('batch_cleanup'):
                         batch.cleanup()
 

@@ -151,6 +151,11 @@ export interface ValidationConfig {
   resolution: number;
   validate_every_n_steps: number;
   validation_sigmas?: number[];
+  adaptive_lr?: boolean;
+  adaptive_lr_count?: number;
+  adaptive_lr_factor?: number;
+  adaptive_lr_min?: number;
+  adaptive_lr_max?: number;
 }
 
 export interface TrainConfig {
