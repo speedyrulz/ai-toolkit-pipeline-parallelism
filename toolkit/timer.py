@@ -66,6 +66,13 @@ class Timer:
     def __call__(self, timer_name):
         """Enable the use of the Timer class as a context manager."""
         self.current_timer = timer_name
+        # a stack, not a single slot: `with` blocks nest (e.g. training-hook
+        # timers running inside the validate timer during adaptive-lr
+        # replays), and the outer exit must stop ITS timer, not the last one
+        # entered
+        if not hasattr(self, '_cm_stack'):
+            self._cm_stack = []
+        self._cm_stack.append(timer_name)
         self.start(timer_name)
         return self
 
@@ -73,9 +80,13 @@ class Timer:
         pass
 
     def __exit__(self, exc_type, exc_value, traceback):
+        if getattr(self, '_cm_stack', None):
+            timer_name = self._cm_stack.pop()
+        else:
+            timer_name = self.current_timer
         if exc_type is None:
             # No exceptions, stop the timer normally
-            self.stop(self.current_timer)
+            self.stop(timer_name)
         else:
             # There was an exception, cancel the timer
-            self.cancel(self.current_timer)
+            self.cancel(timer_name)
