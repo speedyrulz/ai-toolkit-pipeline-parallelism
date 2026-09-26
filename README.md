@@ -35,6 +35,7 @@ AI Toolkit is an easy to use all in one training suite for diffusion models. I t
 - [circlestone-labs/Anima-Base-v1.0-Diffusers](https://huggingface.co/circlestone-labs/Anima-Base-v1.0-Diffusers) (Anima)
 - [krea/Krea-2-Raw](https://huggingface.co/krea/Krea-2-Raw) (Krea 2)
 - [krea/Krea-2-Turbo](https://huggingface.co/krea/Krea-2-Turbo) (Krea 2 Turbo)
+- [inclusionAI/Ming-Image-0.1-Design](https://huggingface.co/inclusionAI/Ming-Image-0.1-Design) (Ming-Image 0.1 Design)
 - [microsoft/Mage-Flow-Base](https://huggingface.co/microsoft/Mage-Flow-Base) (Mage-Flow)
 
 ### Instruction / Edit
@@ -101,7 +102,7 @@ cd ai-toolkit
 
 Then start the manager with the script for your platform:
 
-Linux:
+Linux (x86_64 and ARM64, including DGX Spark / DGX OS):
 ```bash
 chmod +x run_linux.sh
 ./run_linux.sh
@@ -145,7 +146,7 @@ pip3 install --no-cache-dir torch==2.13.0 torchvision==0.28.0 torchaudio==2.11.0
 pip3 install -r requirements.txt
 ```
 
-For devices running **DGX OS** (including DGX Spark), follow [these](dgx_instructions.md) instructions.
+These steps also work on ARM64 Linux, including DGX Spark / DGX OS.
 
 
 Windows:
@@ -362,10 +363,10 @@ Everything else should work the same including layer targeting.
 
 If you enjoy my projects or use them commercially, please consider sponsoring me. Every bit helps! 💖
 
-<a href="https://ostris.com/sponsors" target="_blank"><img src="https://ostris.com/wp-content/uploads/2025/05/support-banner2.png" alt="Support my work" style="max-width:100%;height:auto;"></a>
+<a href="https://ostris.com/support" target="_blank"><img src="https://ostris.com/wp-content/uploads/2025/05/support-banner2.png" alt="Support my work" style="max-width:100%;height:auto;"></a>
 
 ### Current Sponsors
 
 All of these people / organizations are the ones who selflessly make this project possible. Thank you!!
 
-<a href="https://ostris.com/sponsors"><img src="https://ostris.com/sponsors.svg" alt="Sponsors" style="width:100%;height:auto;"></a>
+<a href="https://ostris.com/support"><img src="https://ostris.com/sponsors.svg" alt="Sponsors" style="width:100%;height:auto;"></a>
