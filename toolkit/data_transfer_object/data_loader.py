@@ -88,6 +88,11 @@ class FileItemDTO(
         )
         # D-OPSD: also cache teacher embeds with the item's own media as reference 1
         self.dopsd_self_ref = kwargs.get("dopsd_self_ref", False)
+        # teacher matching: which privileged conditions the teacher embeds
+        # carry ('ref' = the item itself, 'subject_ref' = its control
+        # pictures) and the model's caption builder for them
+        self.teacher_conditions = kwargs.get("teacher_conditions", None)
+        self._teacher_caption_fn = kwargs.get("teacher_caption_fn", None)
         self.te_padding_side = kwargs.get("te_padding_side", "right")
         self.latent_space_version = kwargs.get("latent_space_version", "sd1")
         self.text_embedding_space_version = kwargs.get("text_embedding_space_version", "sd1")
@@ -253,8 +258,10 @@ class DataLoaderBatchDTO:
                     for x in self.file_items
                 ]
 
-            # set by the trainer around the D-OPSD teacher pass
-            self.dopsd_teacher_pass: bool = False
+            # set by the trainer around the teacher pass: the teacher's
+            # conditions ('ref' / 'subject_ref'), 'anchor' for the
+            # condition-free preservation pass, False for the student pass
+            self.dopsd_teacher_pass: Union[bool, str] = False
 
             self.num_frames: int = self.file_items[0].num_frames
 

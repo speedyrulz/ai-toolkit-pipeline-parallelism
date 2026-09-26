@@ -59,6 +59,16 @@ from toolkit.models.v2.resolver import (
     resolve_comfy_file,
 )
 from toolkit.paths import MODELS_PATH
+from toolkit.teacher_matching import (
+    TEACHER_CONDITIONS_REF,
+    TEACHER_CONDITIONS_SUBJECT_REF,
+    TEACHER_PASS_ANCHOR,
+    TeacherMatchingConfig,
+    base_sigma_from_uniform,
+    unshift_sigma,
+    wrap_ref_teacher_caption,
+    wrap_subject_reference_caption,
+)
 from toolkit.util.comfy_quant_import import import_comfy_quantized_layers
 from toolkit.util.ostris_quant import OstrisLinear
 from toolkit.samplers.custom_flowmatch_sampler import (
@@ -215,6 +225,107 @@ class MinimaxH3Model(BaseModel):
         self.max_text_length = int(
             self.model_config.model_kwargs.get("max_text_length", 512)
         )
+        # teacher matching: a no-grad pass of the frozen base (LoRA off, the
+        # training adapter still on) under privileged conditions becomes the
+        # flow target of the text-only student pass. ``dopsd: true`` is the
+        # legacy spelling of the ``ref`` (self-reference) teacher.
+        self.teacher_matching = TeacherMatchingConfig(self.model_config.model_kwargs)
+        self.teacher_conditions = self.teacher_matching.conditions
+        if self.teacher_matching.enabled:
+            if self.arch != "minimax_h3_ref2va":
+                raise ValueError(
+                    f"teacher_conditions {self.teacher_conditions!r} needs the ref2va "
+                    f"layout: use arch minimax_h3_ref2va (got {self.arch})"
+                )
+            self.print_and_status_update(self.teacher_matching.describe())
+        # the ref teacher is the D-OPSD self-reference pass: the trainer and
+        # dataloader keep their dopsd_* plumbing for it
+        self.dopsd_self_ref = self.teacher_conditions == TEACHER_CONDITIONS_REF
+        if self.dopsd_self_ref:
+            self.require_pixel_tensor_cache = True
+        self.dopsd_bleed_strength = self.teacher_matching.bleed_strength if self.teacher_matching.enabled else 0.0
+
+    # ------------------------------------------------------------------
+    # Teacher matching hooks
+    # ------------------------------------------------------------------
+    def base_sigma_of(self, timesteps: torch.Tensor) -> float:
+        """The pre-shift base draw behind the trainer's video timestep (0..1000
+        = the shifted video sigma); the teacher gate and the focus band live
+        in these units so they read the same across video/audio shifts."""
+        sigma_v = float(timesteps.reshape(-1)[0].item()) / 1000.0
+        return float(unshift_sigma(sigma_v, self.video_sigma_shift))
+
+    def remap_train_timesteps(
+        self, timesteps: torch.Tensor, t_lower: float, t_upper: float
+    ) -> torch.Tensor:
+        """Timestep focus: with probability ``timestep_focus_prob`` redraw the
+        base sigma uniformly inside the focus band, else uniformly over the
+        trainer's clipped range ``[t_lower, t_upper]`` (video timesteps, 0..1000).
+        Off (prob 0) returns the trainer's own draw untouched."""
+        tm = self.teacher_matching
+        if not tm.enabled or tm.focus_prob <= 0.0:
+            return timesteps
+        shift = self.video_sigma_shift
+        lower = float(unshift_sigma(min(t_lower, t_upper) / 1000.0, shift))
+        upper = float(unshift_sigma(max(t_lower, t_upper) / 1000.0, shift))
+        u = torch.rand(timesteps.shape, device=timesteps.device, dtype=torch.float32)
+        base = base_sigma_from_uniform(
+            u,
+            lower=lower,
+            upper=upper,
+            focus_min=max(tm.focus_min, lower),
+            focus_max=min(tm.focus_max, upper),
+            focus_prob=tm.focus_prob,
+        )
+        sigma_v = packing.shift_sigma(base, shift) * 1000.0
+        return sigma_v.clamp(min(t_lower, t_upper), max(t_lower, t_upper)).to(timesteps.dtype)
+
+    def teacher_base_sigma_range(self, t_lower: float, t_upper: float):
+        """The clipped base-sigma range the anchor density compensation
+        measures against, from the trainer's timestep bounds."""
+        shift = self.video_sigma_shift
+        return (
+            float(unshift_sigma(min(t_lower, t_upper) / 1000.0, shift)),
+            float(unshift_sigma(max(t_lower, t_upper) / 1000.0, shift)),
+        )
+
+    def build_teacher_caption(self, caption: str, file_item) -> str:
+        """The caption the teacher's text rows are encoded from."""
+        tm = self.teacher_matching
+        is_video = bool(getattr(file_item, "is_video", False))
+        if tm.conditions == TEACHER_CONDITIONS_REF:
+            if tm.caption_style == "token":
+                # upstream D-OPSD: trigger word -> the self-reference token,
+                # or the token prepended when there is no trigger word
+                token = "<Video 1>" if is_video else "<Picture 1>"
+                trigger = getattr(file_item, "trigger_word", None)
+                if trigger is not None:
+                    return caption.replace(trigger, token)
+                return f"{token} {caption}".strip()
+            return wrap_ref_teacher_caption(caption, is_video=is_video)
+        if tm.conditions == TEACHER_CONDITIONS_SUBJECT_REF:
+            refs = getattr(file_item, "control_path", None)
+            if refs is None:
+                refs = []
+            elif not isinstance(refs, list):
+                refs = [refs]
+            if len(refs) == 0:
+                raise ValueError(
+                    "subject_ref teacher matching needs reference pictures on every "
+                    f"item (a control_path dataset); none for {getattr(file_item, 'path', '?')}"
+                )
+            as_video = self._image_ref_video_frames() > 0
+            return wrap_subject_reference_caption(
+                caption,
+                len(refs),
+                still_image=not is_video,
+                ref_label="Video" if as_video else "Picture",
+            )
+        raise ValueError(f"no teacher caption for teacher_conditions {tm.conditions!r}")
+
+    def _image_ref_video_frames(self) -> int:
+        # ref2va overrides; the base model keeps native <Picture> references
+        return 0
 
     @classmethod
     def get_train_scheduler(cls):
@@ -1117,6 +1228,46 @@ class MinimaxH3Ref2VAModel(MinimaxH3Model):
     temporal-span rotary advance, and a ``<Video k>: `` timestamped Qwen
     presentation — so a LoRA trained on image references exercises the same
     pathway that video references use at inference.
+
+    Teacher matching (``model_kwargs``, all optional; the recipe follows
+    kohya-ss/musubi-tuner's MiniMax-H3 teacher matching): a no-grad pass of
+    the frozen base (LoRA off, the training adapter still on) under
+    privileged conditions becomes the flow target of the text-only student
+    pass, for video and audio alike. Requires ``train.cache_text_embeddings``.
+
+      teacher_matching: true
+      teacher_conditions: ref | subject_ref
+          ref          the clip itself (video + soundtrack) is the teacher's
+                       only reference; needs cache_tensors_to_disk on the
+                       dataset and no control images (``dopsd: true`` is the
+                       legacy spelling, with token captions and bleed 1.0)
+          subject_ref  the item's control pictures are the teacher's subject
+                       references; the student never sees them
+      teacher_caption_style: musubi (default) | token
+          how the teacher caption is built: the official declaration blocks,
+          or the trigger word -> <Picture 1>/<Video 1> substitution
+      teacher_condition_sigma_min: 0.0 / teacher_condition_sigma_max: 1.0
+          the base-sigma window (pre-shift, 1 = pure noise) where the teacher
+          is conditioned; outside it the teacher runs on the student's own
+          text with no conditions (a base-preservation anchor). 0.75 is the
+          validated max for ref, 0.15 the validated min for subject_ref
+      teacher_loss_dc_weight: 1.0    weight of the residual's per-channel DC
+                                     (palette) on teaching steps; 0.3 stops
+                                     palette absorption as a style shift
+      teacher_loss_mag_weight: 1.0   weight of the magnitude term of the
+                                     decomposed loss on teaching steps; < 1
+                                     prioritises direction over magnitude
+      teacher_preservation_weight: 1.0   loss weight of anchor steps (on top
+                                     of the automatic focus compensation)
+      teacher_bleed_strength: 0.0    D-OPSD extra loss toward the plain flow
+                                     target (not in musubi's recipe)
+      timestep_focus_prob: 0.0 / timestep_focus_min: 0.4 / timestep_focus_max: 0.8
+          draw the base sigma inside the focus band with this probability
+          (0.5 roughly doubles convergence in the content-decision band)
+
+    The loss does not converge to zero (the teacher knows things the text
+    cannot); read the ``teacher/*`` logs (cos, norm_ratio, residual DC/AC
+    RMS, flow gap) and the ``loss/teaching`` vs ``loss/anchor`` curves.
     """
 
     arch = "minimax_h3_ref2va"
@@ -1152,15 +1303,9 @@ class MinimaxH3Ref2VAModel(MinimaxH3Model):
         # control VIDEOS are cached like dataset items and consumed as
         # multi-frame reference blocks
         self.supports_video_control_images = True
-        # D-OPSD: a no-grad teacher pass with the target as its own reference
-        # becomes the training target for the reference-free student pass
-        self.dopsd = bool(self.model_config.model_kwargs.get("dopsd", False))
-        if self.dopsd:
-            self.dopsd_self_ref = True
-            self.require_pixel_tensor_cache = True
-            self.dopsd_bleed_strength = float(
-                self.model_config.model_kwargs.get("dopsd_bleed_strength", 1.0)
-            )
+        # teacher matching (ref / subject_ref) is parsed by the base class;
+        # see _build_condition for how the teacher and student passes differ
+        self.dopsd = self.dopsd_self_ref
 
     def _dit_component(self) -> str:
         partition = str(
@@ -1183,10 +1328,23 @@ class MinimaxH3Ref2VAModel(MinimaxH3Model):
         # pixel area with its own aspect kept, then encoded on its own grid
         if batch is None:
             return None, None, (), ()
-        if getattr(batch, "dopsd_teacher_pass", False):
+        # teacher matching: the trainer marks the batch with the pass it is
+        # running. ``ref`` conditions the teacher on the clip itself;
+        # ``subject_ref`` hands the control pictures to the teacher only;
+        # the anchor pass (outside the sigma window) and the subject_ref
+        # student pass carry no conditions at all.
+        teacher_pass = getattr(batch, "dopsd_teacher_pass", False)
+        if teacher_pass == TEACHER_PASS_ANCHOR:
+            return None, None, (), ()
+        if teacher_pass is True or teacher_pass == TEACHER_CONDITIONS_REF:
             return self._build_dopsd_teacher_condition(
                 batch, latent_shape, device, dtype
             )
+        if (
+            not teacher_pass
+            and self.teacher_conditions == TEACHER_CONDITIONS_SUBJECT_REF
+        ):
+            return None, None, (), ()
         controls_per_item = None
         if batch.control_tensor_list is not None:
             controls_per_item = batch.control_tensor_list

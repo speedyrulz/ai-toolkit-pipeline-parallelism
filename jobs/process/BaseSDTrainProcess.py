@@ -1317,6 +1317,21 @@ class BaseSDTrainProcess(BaseTrainProcess):
             with self.timer('convert_timestep_indices_to_timesteps'):
                 # convert the timestep_indices to a timestep
                 timesteps = self.sd.noise_scheduler.timesteps[timestep_indices.long()]
+                # models that own part of the draw (e.g. MiniMax-H3's timestep
+                # focus band for teacher matching) remap it inside the clipped
+                # range; index 0 is full noise, so max_noise_steps is the low bound
+                if (
+                    hasattr(self.sd, 'remap_train_timesteps')
+                    and self.train_config.noise_scheduler == 'flowmatch'
+                    and self.train_config.timestep_type not in [
+                        'one_step', 'two_step', 'four_step', 'eight_step', 'next_sample'
+                    ]
+                ):
+                    sched_timesteps = self.sd.noise_scheduler.timesteps
+                    t_lower = float(sched_timesteps[max_noise_steps].item())
+                    t_upper = float(sched_timesteps[min_noise_steps].item())
+                    self._train_timestep_bounds = (t_lower, t_upper)
+                    timesteps = self.sd.remap_train_timesteps(timesteps, t_lower, t_upper)
                 
             with self.timer('prepare_noise'):
                 # get noise

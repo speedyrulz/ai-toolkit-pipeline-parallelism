@@ -1,0 +1,96 @@
+# MiniMax-H3 ref2va teacher matching: a text-only (t2va) LoRA learns from the
+# frozen base's prediction under privileged conditions the student never sees.
+#
+# Two teachers are available (model_kwargs.teacher_conditions):
+#   subject_ref  other pictures of the subject (the dataset's control images)
+#                are handed to the teacher as <Picture i> subject references.
+#                Identity from appearance; image or video targets.
+#   ref          the training clip itself (video + soundtrack) is the teacher's
+#                copy-source reference. Identity + voice; video targets 2-15s.
+#                Needs cache_tensors_to_disk: true and NO control images.
+#
+# The recipe follows kohya-ss/musubi-tuner's docs/minimax_h3.md. The loss does
+# not converge to zero; the strongest checkpoints tend to sit at or just after
+# the teaching-band residual plateaus (a few hundred steps).
+---
+job: extension
+config:
+  name: "my_minimax_h3_subject_ref_lora_v1"
+  process:
+    - type: 'sd_trainer'
+      training_folder: "output"
+      device: cuda:0
+      network:
+        type: "lora"
+        linear: 32
+        linear_alpha: 32
+      save:
+        dtype: float16
+        save_every: 100
+        max_step_saves_to_keep: 6
+      datasets:
+        # subject_ref: every item needs one or more reference pictures of the
+        # subject in control_path (same file stem as the target). Targets can
+        # be images (num_frames: 1) or videos on the 17n+5 frame grid.
+        - folder_path: "/path/to/targets"
+          control_path: "/path/to/subject/pictures"
+          caption_ext: "txt"
+          caption_dropout_rate: 0.0
+          num_frames: 1
+          resolution: [ 512, 768 ]
+          # ref teacher only: the teacher reads the item's own pixels
+          # cache_tensors_to_disk: true
+          # do_audio: true
+      train:
+        batch_size: 1
+        steps: 500
+        gradient_accumulation: 1
+        train_unet: true
+        train_text_encoder: false
+        gradient_checkpointing: true
+        noise_scheduler: "flowmatch"
+        timestep_type: 'shift'
+        optimizer: "adamw8bit"
+        lr: 3e-4
+        lr_scheduler: "constant_with_warmup"
+        lr_scheduler_params:
+          num_warmup_steps: 50
+        dtype: bf16
+        # teacher matching needs the teacher embeds cached next to the
+        # student's (both are keyed by caption and teacher kind)
+        cache_text_embeddings: true
+        # incompatible with teacher matching (the teacher already lives in
+        # the distilled guided space)
+        do_guidance_loss: false
+      model:
+        arch: 'minimax_h3_ref2va'
+        quantize: true
+        quantize_te: true
+        low_vram: true
+        model_kwargs:
+          partition: ref2va_pruned
+          teacher_matching: true
+          teacher_conditions: subject_ref
+          # --- subject_ref validated recipe ---
+          teacher_condition_sigma_min: 0.15
+          teacher_loss_mag_weight: 0.5
+          teacher_loss_dc_weight: 0.3
+          # --- ref validated recipe (swap teacher_conditions: ref) ---
+          # teacher_condition_sigma_max: 0.75
+          # teacher_loss_dc_weight: 0.3
+          # timestep_focus_prob: 0.5
+      sample:
+        sampler: "flowmatch"
+        sample_every: 100
+        width: 512
+        height: 512
+        num_frames: 1
+        prompts:
+          - "a portrait of p3r5on smiling in a sunlit kitchen"
+        seed: 42
+        walk_seed: true
+        guidance_scale: 1
+        sample_steps: 20
+meta:
+  name: "[name]"
+  version: '1.0'

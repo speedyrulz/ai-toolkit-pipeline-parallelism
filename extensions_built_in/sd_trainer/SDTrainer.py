@@ -37,6 +37,12 @@ import math
 from toolkit.train_tools import precondition_model_outputs_flow_match
 from toolkit.models.diffusion_feature_extraction import DiffusionFeatureExtractor, load_dfe
 from toolkit.util.losses import wavelet_loss, stepped_loss
+from toolkit.teacher_matching import (
+    TEACHER_PASS_ANCHOR,
+    dc_attenuated_prediction,
+    decomposed_flow_loss,
+    prediction_geometry_log,
+)
 import torch.nn.functional as F
 from toolkit.unloader import unload_text_encoder
 from PIL import Image
@@ -324,9 +330,27 @@ class SDTrainer(BaseSDTrainProcess):
         
         if self.train_config.do_prior_divergence:
             self.do_prior_prediction = True
-        if getattr(self.sd, 'dopsd_self_ref', False):
-            # D-OPSD: the teacher (prior) prediction is the training target
+        if self._teacher_matching_config() is not None:
+            # teacher matching (incl. D-OPSD): the frozen base's prediction is
+            # the training target, so every step runs the prior pass
             self.do_prior_prediction = True
+            if self.network is None:
+                raise ValueError(
+                    "teacher matching needs a LoRA network: the teacher is the base "
+                    "with the network disabled"
+                )
+            if self.train_config.do_guidance_loss:
+                raise ValueError(
+                    "teacher matching and do_guidance_loss are mutually exclusive: "
+                    "the teacher target already lives in the distilled guided space"
+                )
+            if self.train_config.diff_output_preservation or self.train_config.blank_prompt_preservation:
+                raise ValueError(
+                    "teacher matching cannot be combined with diff_output_preservation "
+                    "or blank_prompt_preservation (they replace the teacher's prompt)"
+                )
+        # per-step teacher matching state (set around the prior pass)
+        self._teacher_step = None
         # move vae to device if we did not cache latents
         if self.sd.vae is not None:
             if not self.is_latents_cached:
@@ -539,6 +563,47 @@ class SDTrainer(BaseSDTrainProcess):
         return output, batch.tensor.to(self.device_torch, dtype=get_torch_dtype(self.train_config.dtype))
 
     # you can expand these in a child class to make customization easier
+    def _teacher_matching_config(self):
+        """The model's TeacherMatchingConfig when teacher matching is on."""
+        tm = getattr(self.sd, 'teacher_matching', None)
+        if tm is not None and getattr(tm, 'enabled', False):
+            return tm
+        return None
+
+    def _teacher_matching_video_loss(self, pred, target, noise, batch, timesteps, step):
+        """Teacher-matching video loss: the decomposed magnitude/direction
+        loss against the teacher prediction, with the residual DC attenuated
+        on conditioned (teaching) steps. Returns a per-element tensor that
+        reduces to the per-sample loss through the usual mask/mean pipeline
+        (the loss itself is a per-sample scalar)."""
+        tm = self.sd.teacher_matching
+        conditioned = step['conditioned']
+        p = pred.float()
+        t = target.float()
+        with torch.no_grad():
+            # how far the teacher deviates from the raw flow target
+            if hasattr(self.sd, 'get_loss_target'):
+                flow_target = self.sd.get_loss_target(noise=noise, batch=batch, timesteps=timesteps)
+            elif self.sd.is_flow_matching:
+                flow_target = noise - batch.latents
+            else:
+                flow_target = noise
+            self.additional_logs['teacher/video_flow_gap_rms'] = (
+                (t - flow_target.float()).pow(2).mean().sqrt().item()
+            )
+            self.additional_logs.update(prediction_geometry_log('video', p, t))
+        # the DC attenuation applies only to conditioned teaching steps: on
+        # preservation steps the DC penalty is exactly what pulls palette
+        # drift back to the base
+        if conditioned and tm.dc_weight != 1.0:
+            p = dc_attenuated_prediction(p, t, tm.dc_weight)
+        # the magnitude down-weight is likewise education-only: on anchor
+        # steps the magnitude term pulls learned de-amplification back to the
+        # base norm
+        loss_b = decomposed_flow_loss(p, t, tm.mag_weight if conditioned else 1.0, 1.0)
+        shape = [pred.shape[0]] + [1] * (pred.ndim - 1)
+        return loss_b.view(shape).expand_as(pred)
+
     def calculate_loss(
             self,
             noise_pred: torch.Tensor,
@@ -648,10 +713,12 @@ class SDTrainer(BaseSDTrainProcess):
             assert not self.train_config.train_turbo
             # matching adapter prediction
             target = prior_pred
-            if getattr(self.sd, 'dopsd_self_ref', False):
+            teacher_cfg = self._teacher_matching_config()
+            if teacher_cfg is not None:
                 if isinstance(prior_pred, DTO) and prior_pred.get('audio') is not None:
                     # the teacher's audio prediction is the audio target too
                     audio_target = prior_pred.get('audio').detach()
+            if teacher_cfg is not None and teacher_cfg.bleed_strength > 0.0:
                 # D-OPSD bleed: also train against the normal (non-teacher) target
                 if hasattr(self.sd, 'get_loss_target'):
                     dopsd_normal_target = self.sd.get_loss_target(
@@ -875,7 +942,11 @@ class SDTrainer(BaseSDTrainProcess):
 
         ignore_snr = False
 
-        if loss_target == 'source' or loss_target == 'unaugmented':
+        teacher_step = getattr(self, '_teacher_step', None)
+        if teacher_step is not None:
+            assert not self.train_config.train_turbo
+            loss = self._teacher_matching_video_loss(pred, target, noise, batch, timesteps, teacher_step)
+        elif loss_target == 'source' or loss_target == 'unaugmented':
             assert not self.train_config.train_turbo
             # ignore_snr = True
             if batch.sigmas is None:
@@ -1070,11 +1141,45 @@ class SDTrainer(BaseSDTrainProcess):
         
         # check for audio loss
         if audio_pred is not None and audio_target is not None:
-            audio_loss = torch.nn.functional.mse_loss(audio_pred.float(), audio_target.float(), reduction="mean")
+            if teacher_step is not None:
+                # the audio stream matches the teacher with the same
+                # decomposed loss; the audio anchor keeps its full DC
+                tm = self.sd.teacher_matching
+                audio_loss = decomposed_flow_loss(
+                    audio_pred.float(),
+                    audio_target.float(),
+                    tm.mag_weight if teacher_step['conditioned'] else 1.0,
+                    1.0,
+                ).mean()
+                self.additional_logs.update(
+                    prediction_geometry_log('audio', audio_pred, audio_target)
+                )
+            else:
+                audio_loss = torch.nn.functional.mse_loss(audio_pred.float(), audio_target.float(), reduction="mean")
             audio_loss = audio_loss * self.train_config.audio_loss_multiplier
             self.additional_logs['loss/img'] = loss.item()
             self.additional_logs['loss/audio'] = audio_loss.item()
             loss = loss + audio_loss
+
+        if teacher_step is not None:
+            # preservation-anchor steps: user weight on top of the automatic
+            # focus compensation, so raising the timestep focus does not
+            # silently weaken the drift protection. The two populations are
+            # logged as separate curves.
+            self.additional_logs['teacher/base_sigma'] = teacher_step['base_sigma']
+            self.additional_logs['teacher/conditioned'] = 1.0 if teacher_step['conditioned'] else 0.0
+            if teacher_step['conditioned']:
+                self.additional_logs.pop('loss/anchor', None)
+                self.additional_logs.pop('teacher/anchor_multiplier', None)
+                self.additional_logs['loss/teaching'] = loss.item()
+            else:
+                lower, upper = teacher_step['sigma_range']
+                multiplier = self.sd.teacher_matching.anchor_multiplier(lower, upper)
+                if multiplier != 1.0:
+                    loss = loss * multiplier
+                self.additional_logs.pop('loss/teaching', None)
+                self.additional_logs['teacher/anchor_multiplier'] = multiplier
+                self.additional_logs['loss/anchor'] = loss.item()
 
         # check for additional losses
         if self.adapter is not None and hasattr(self.adapter, "additional_loss") and self.adapter.additional_loss is not None:
@@ -1462,6 +1567,8 @@ class SDTrainer(BaseSDTrainProcess):
         # only; the returned loss stays unscaled for logging.
         if getattr(self.sd, 'is_llm', False):
             return self.train_llm_accumulation(batch, accum_scale=accum_scale)
+        # teacher matching state is per step: set around the prior pass below
+        self._teacher_step = None
         with torch.no_grad():
             self.timer.start('preprocess_batch')
             if isinstance(self.adapter, CustomAdapter):
@@ -2082,18 +2189,40 @@ class SDTrainer(BaseSDTrainProcess):
                                 [blank_embeds] * noisy_latents.shape[0]
                             )
                         
-                        is_dopsd = getattr(self.sd, 'dopsd_self_ref', False)
-                        if is_dopsd:
-                            # teacher embeds: caption + vision block naming the item as its own reference
+                        teacher_cfg = self._teacher_matching_config()
+                        self._teacher_step = None
+                        if teacher_cfg is not None:
                             if batch.dopsd_prompt_embeds is None:
                                 raise ValueError(
-                                    "D-OPSD requires cached text embeddings; enable "
-                                    "train.cache_text_embeddings"
+                                    "teacher matching requires cached text embeddings; "
+                                    "enable train.cache_text_embeddings"
                                 )
-                            prior_embeds_to_use = batch.dopsd_prompt_embeds.clone().detach().to(
-                                self.device_torch, dtype=dtype
-                            )
-                            batch.dopsd_teacher_pass = True
+                            # gate on the pre-shift base sigma of this batch's
+                            # draw (one gate per batch, like the reference
+                            # trainer: H3 trains one clip per step)
+                            base_sigma = self.sd.base_sigma_of(timesteps)
+                            conditioned = teacher_cfg.is_conditioned(base_sigma)
+                            if conditioned:
+                                # teacher embeds: the wrapped caption plus the
+                                # vision blocks of the privileged references
+                                prior_embeds_to_use = batch.dopsd_prompt_embeds.clone().detach().to(
+                                    self.device_torch, dtype=dtype
+                                )
+                                batch.dopsd_teacher_pass = teacher_cfg.conditions
+                            else:
+                                # base-preservation anchor: the student's own
+                                # text and layout, no conditions, LoRA off
+                                batch.dopsd_teacher_pass = TEACHER_PASS_ANCHOR
+                            bounds = getattr(self, '_train_timestep_bounds', None)
+                            if bounds is not None and hasattr(self.sd, 'teacher_base_sigma_range'):
+                                sigma_range = self.sd.teacher_base_sigma_range(*bounds)
+                            else:
+                                sigma_range = (0.0, 1.0)
+                            self._teacher_step = {
+                                'base_sigma': base_sigma,
+                                'conditioned': conditioned,
+                                'sigma_range': sigma_range,
+                            }
 
                         prior_pred = self.get_prior_prediction(
                             noisy_latents=noisy_latents,
@@ -2107,7 +2236,7 @@ class SDTrainer(BaseSDTrainProcess):
                             unconditional_embeds=unconditional_embeds,
                             conditioned_prompts=conditioned_prompts
                         )
-                        if is_dopsd:
+                        if teacher_cfg is not None:
                             batch.dopsd_teacher_pass = False
                         if prior_pred is not None:
                             # a DTO prior pred keeps its audio extras through detach

@@ -529,6 +529,8 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
                     encode_control_in_text_embeddings=self.sd.encode_control_in_text_embeddings if self.sd else False,
                     encode_first_frame_in_text_embeddings=getattr(self.sd, 'encode_first_frame_in_text_embeddings', False) if self.sd else False,
                     dopsd_self_ref=getattr(self.sd, 'dopsd_self_ref', False) if self.sd else False,
+                    teacher_conditions=getattr(self.sd, 'teacher_conditions', None) if self.sd else None,
+                    teacher_caption_fn=getattr(self.sd, 'build_teacher_caption', None) if self.sd else None,
                     text_embedding_space_version=text_embedding_space_version,
                     text_embedding_uses_target_size=getattr(self.sd, 'text_embedding_uses_target_size', False) if self.sd else False,
                     te_padding_side=self.sd.te_padding_side if self.sd else "right",
