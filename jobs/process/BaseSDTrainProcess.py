@@ -748,7 +748,15 @@ class BaseSDTrainProcess(BaseTrainProcess):
         
         # # prepare all the models stuff for accelerator (hopefully we dont miss any)
         if self.sd.vae is not None:
-            self.sd.vae = self.accelerator.prepare(self.sd.vae)
+            # prepare() would move the vae onto the accelerator device; a vae
+            # pinned elsewhere (vae_device, e.g. the card a pipeline shard
+            # leaves room on) stays where the model put it
+            vae_on_own_device = (
+                torch.device(self.sd.vae_device_torch) != torch.device(self.sd.device_torch)
+            )
+            self.sd.vae = self.accelerator.prepare(
+                self.sd.vae, device_placement=[not vae_on_own_device]
+            )
         if self.sd.unet is not None:
             self.sd.unet = self.accelerator.prepare(self.sd.unet)
             # todo always tdo it?
