@@ -754,10 +754,6 @@ class ModelConfig:
         self.pipeline_devices: Optional[List[str]] = kwargs.get("pipeline_devices", None)
         # optional per-device weight ratios, e.g. [0.45, 0.55]
         self.pipeline_balance: Optional[List[float]] = kwargs.get("pipeline_balance", None)
-        if self.pipeline_sharding and (self.low_vram or self.layer_offloading):
-            raise ValueError(
-                "pipeline_sharding cannot be combined with low_vram or layer_offloading"
-            )
         if self.layer_offloading and self.qtype == "qfloat8":
             self.qtype = "float8"
         if self.layer_offloading and self.qtype_te == "qfloat8":
@@ -776,6 +772,20 @@ class ModelConfig:
         # 0 is off and 1.0 is 100% of the layers
         self.layer_offloading_transformer_percent = kwargs.get("layer_offloading_transformer_percent", 1.0)
         self.layer_offloading_text_encoder_percent = kwargs.get("layer_offloading_text_encoder_percent", 1.0)
+        # the shard attach owns the transformer's placement, so neither cpu
+        # parking nor a transformer memory manager can coexist with it. The
+        # text encoder is a separate module on its own device: offloading it
+        # alone (transformer percent 0) is fine, and is how a text encoder
+        # too big for the card next to its shard still runs.
+        if self.pipeline_sharding and (
+            self.low_vram
+            or (self.layer_offloading and self.layer_offloading_transformer_percent > 0)
+        ):
+            raise ValueError(
+                "pipeline_sharding cannot be combined with low_vram or transformer "
+                "layer offloading (set layer_offloading_transformer_percent: 0 to "
+                "offload only the text encoder)"
+            )
 
         # can be used to load the extras like text encoder or vae from here
         # only setup for some models but will prevent having to download the te for

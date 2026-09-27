@@ -64,8 +64,12 @@ config:
         do_guidance_loss: false
       model:
         arch: 'minimax_h3_ref2va'
+        # the Comfy-Org weights ship pre-quantized (int8 convrot DiT, nvfp4
+        # TE); these qtypes keep them as-is, anything else re-quantizes
         quantize: true
+        qtype: convrot8
         quantize_te: true
+        qtype_te: nvfp4
         low_vram: true
         model_kwargs:
           partition: ref2va_pruned
