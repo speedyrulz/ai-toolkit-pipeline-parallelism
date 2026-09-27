@@ -649,8 +649,10 @@ class MinimaxH3Model(BaseModel):
     def get_prompt_embeds(self, prompt, control_images=None) -> AdvancedPromptEmbeds:
         if isinstance(prompt, str):
             prompt = [prompt]
+        # the text encoder lives on te_device (its own card under pipeline
+        # sharding); the embeds come back to the trainer's device below
         if self.text_encoder.device == torch.device("cpu"):
-            self.text_encoder.to(self.device_torch)
+            self.text_encoder.to(self.te_device_torch)
 
         # control tensors arrive in [0, 1]; the Qwen3-VL processor wants PIL
         keyframes_per_prompt = [None] * len(prompt)
@@ -702,11 +704,11 @@ class MinimaxH3Model(BaseModel):
                 self.processor,
                 p.strip(),
                 keyframes=keyframes,
-                device=self.device_torch,
+                device=self.te_device_torch,
                 dtype=self.torch_dtype,
                 max_length=self.max_text_length,
             )
-            embeds_list.append(embeds)
+            embeds_list.append(embeds.to(self.device_torch))
             tags_list.append(tags)
 
         pe = AdvancedPromptEmbeds(text_embeds=embeds_list, text_token_tags=tags_list)
@@ -810,7 +812,7 @@ class MinimaxH3Model(BaseModel):
         import torchaudio
 
         if self.vae.device == torch.device("cpu"):
-            self.vae.to(self.device_torch)
+            self.vae.to(self.vae_device_torch)
 
         packed = []
         for audio_data in audio_data_list:

@@ -63,6 +63,7 @@ config:
         # the distilled guided space)
         do_guidance_loss: false
       model:
+        name_or_path: "Comfy-Org/MiniMax-H3"
         arch: 'minimax_h3_ref2va'
         # the Comfy-Org weights ship pre-quantized (int8 convrot DiT, nvfp4
         # TE); these qtypes keep them as-is, anything else re-quantizes
