@@ -453,7 +453,16 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 ))
             configs = self.post_process_generate_image_config_list(configs)
             print_acc(f"Generating {len(configs)} likeness scoring samples")
-            self.sd.generate_images(configs, sampler=sample_config.sampler)
+            # generate_images reads prompt embeddings from sample_prompts_cache
+            # by index when the prompts were pre-encoded; point it at the
+            # scoring prompts' own cache for this call
+            regular_cache = self.sd.sample_prompts_cache
+            if regular_cache is not None:
+                self.sd.sample_prompts_cache = getattr(self.sd, 'likeness_prompts_cache', None)
+            try:
+                self.sd.generate_images(configs, sampler=sample_config.sampler)
+            finally:
+                self.sd.sample_prompts_cache = regular_cache
         else:
             # score this round's regular samples
             new_files = sorted(
