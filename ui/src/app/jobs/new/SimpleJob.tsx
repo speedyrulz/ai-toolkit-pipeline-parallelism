@@ -2122,9 +2122,17 @@ export default function SimpleJob({
                       onChange={value => setJobConfig(value, 'config.process[0].sample.likeness.device')}
                       options={[
                         { value: 'cpu', label: 'CPU (keeps training GPUs free)' },
-                        { value: 'gpu', label: 'GPU' },
+                        { value: 'gpu', label: 'GPU (~12x faster, needs ~3.5 GB free)' },
                       ]}
                     />
+                    {jobConfig.config.process[0].sample.likeness?.device === 'gpu' && (
+                      <NumberInput
+                        label="Scoring GPU (index as in nvidia-smi, -1 = default)"
+                        value={jobConfig.config.process[0].sample.likeness?.gpu_index ?? -1}
+                        onChange={value => setJobConfig(value, 'config.process[0].sample.likeness.gpu_index')}
+                        min={-1}
+                      />
+                    )}
                     <TextInput
                       label="Overall Weights (face, body shape, body detail)"
                       value={(jobConfig.config.process[0].sample.likeness?.weights ?? [1, 1, 1]).join(', ')}

@@ -95,6 +95,10 @@ class LikenessConfig:
         # cpu keeps the scorer off the training gpus
         self.device: str = kwargs.get('device', 'cpu')
         self.cpu_threads: int = int(kwargs.get('cpu_threads', 0))
+        # gpu to score on when device is 'gpu', numbered like nvidia-smi and
+        # the UI's gpu list; -1 = the default gpu. Scoring peaks at about
+        # 3.5 GB, so pick a gpu with that much room beside training.
+        self.gpu_index: int = int(kwargs.get('gpu_index', -1))
         # 'auto' = the bf16 checkpoint on cpu, int8 on gpu
         self.sam3d_model: str = kwargs.get('sam3d_model', 'auto')
         self.clip_vision_model: str = kwargs.get('clip_vision_model', 'dinov2_large.safetensors')

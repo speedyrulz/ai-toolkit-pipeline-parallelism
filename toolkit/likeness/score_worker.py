@@ -62,6 +62,8 @@ def _parse_args():
     p.add_argument("--out", required=True, help="folder for reports and the CSV")
     p.add_argument("--device", default="cpu", choices=["cpu", "gpu"])
     p.add_argument("--cpu-threads", type=int, default=0)
+    # gpu to score on, numbered like nvidia-smi (PCI bus order); -1 = default
+    p.add_argument("--gpu-index", type=int, default=-1)
     # auto: the bf16 checkpoint on cpu, int8 on gpu. The int8 (convrot)
     # file has no fast cpu path: measured 304s per body fit on cpu vs 7-10s
     # for bf16 on the same 6 threads
@@ -203,6 +205,9 @@ class Scorer:
         t1 = time.time()
         self.ref_poses = [self._predict(img) for img in self.ref_images]
         _log(f"reference body fits: {time.time() - t1:.0f}s for {len(ref_files)} images")
+        if a.device == "gpu":
+            import torch
+            _log(f"scoring on gpu: {torch.cuda.get_device_name(0)}")
         _log(f"ready: {len(ref_files)} references, setup took {time.time() - t0:.0f}s")
 
         w = [float(x) for x in a.weights.split(",")]
@@ -318,6 +323,11 @@ class Scorer:
 
 def main():
     a = _parse_args()
+    if a.device == "gpu" and a.gpu_index >= 0:
+        # must be set before torch initializes CUDA; PCI order matches
+        # nvidia-smi and the trainer UI's gpu numbering
+        os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(a.gpu_index)
     _bootstrap_comfy(a.comfyui, a.device)
     import torch
     # ComfyUI's executor runs every node under inference mode; the nodes

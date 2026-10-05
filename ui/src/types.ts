@@ -272,6 +272,7 @@ export interface LikenessConfig {
   comfyui_path: string;
   python?: string;
   device?: 'cpu' | 'gpu';
+  gpu_index?: number;
   cpu_threads?: number;
   sam3d_model?: string;
   clip_vision_model?: string;

@@ -79,6 +79,7 @@ class LikenessScorer:
             "--out", conv(self.out_dir),
             "--device", c.device,
             "--cpu-threads", str(c.cpu_threads),
+            "--gpu-index", str(c.gpu_index),
             "--sam3d-model", c.sam3d_model,
             "--clip-vision-model", c.clip_vision_model,
             "--face-library", c.face_library,
@@ -100,7 +101,10 @@ class LikenessScorer:
     def start(self):
         os.makedirs(self.out_dir, exist_ok=True)
         cmd = self._command()
-        print_acc(f"Starting likeness scorer ({self.config.device}); log: "
+        where = self.config.device
+        if where == "gpu" and self.config.gpu_index >= 0:
+            where = f"gpu {self.config.gpu_index}"
+        print_acc(f"Starting likeness scorer ({where}); log: "
                   f"{os.path.join(self.out_dir, 'likeness_worker.log')}")
         self._stderr_file = open(os.path.join(self.out_dir, "likeness_worker.log"), "a",
                                  encoding="utf-8", errors="replace")
