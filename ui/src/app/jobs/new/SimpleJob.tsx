@@ -2070,6 +2070,96 @@ export default function SimpleJob({
               Add Prompt
             </button>
           </Card>
+          <div className="mt-6">
+            <Card
+              title="Character Likeness"
+              toggled={!!jobConfig.config.process[0].sample.likeness?.enabled}
+              onToggle={value => {
+                if (value) {
+                  setJobConfig(
+                    {
+                      enabled: true,
+                      reference_folder: jobConfig.config.process[0].sample.likeness?.reference_folder ?? '',
+                      comfyui_path: jobConfig.config.process[0].sample.likeness?.comfyui_path ?? '',
+                      device: 'cpu',
+                      samples: jobConfig.config.process[0].sample.likeness?.samples ?? [],
+                    },
+                    'config.process[0].sample.likeness',
+                  );
+                } else {
+                  setJobConfig(undefined, 'config.process[0].sample.likeness');
+                }
+              }}
+            >
+              {jobConfig.config.process[0].sample.likeness?.enabled && (
+                <>
+                  <p className="text-sm text-gray-400 mb-4">
+                    After every sample round, the samples are scored against reference images of the character for
+                    face, body shape and body detail likeness, by a ComfyUI install that has the character similarity
+                    nodes. Scoring runs in the background while training continues; scores are logged as likeness/*
+                    and saved to likeness/likeness_scores.csv with a report per step. Scoring prompts are rendered
+                    every round with fixed seeds so rounds compare directly; they should show the character&apos;s
+                    face and full body in the reference outfit. Leave them empty to score the regular samples.
+                  </p>
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                    <TextInput
+                      label="Reference Images Folder"
+                      value={jobConfig.config.process[0].sample.likeness?.reference_folder ?? ''}
+                      onChange={value => setJobConfig(value, 'config.process[0].sample.likeness.reference_folder')}
+                      placeholder="eg. C:\\ai\\refs\\my_character"
+                      required
+                    />
+                    <TextInput
+                      label="ComfyUI Path"
+                      value={jobConfig.config.process[0].sample.likeness?.comfyui_path ?? ''}
+                      onChange={value => setJobConfig(value, 'config.process[0].sample.likeness.comfyui_path')}
+                      placeholder="eg. \\\\wsl.localhost\\Ubuntu-24.04\\home\\me\\ComfyUI"
+                      required
+                    />
+                    <SelectInput
+                      label="Scoring Device"
+                      value={jobConfig.config.process[0].sample.likeness?.device ?? 'cpu'}
+                      onChange={value => setJobConfig(value, 'config.process[0].sample.likeness.device')}
+                      options={[
+                        { value: 'cpu', label: 'CPU (keeps training GPUs free)' },
+                        { value: 'gpu', label: 'GPU' },
+                      ]}
+                    />
+                    <TextInput
+                      label="Overall Weights (face, body shape, body detail)"
+                      value={(jobConfig.config.process[0].sample.likeness?.weights ?? [1, 1, 1]).join(', ')}
+                      onChange={value =>
+                        setJobConfig(
+                          value
+                            .split(',')
+                            .map((v: string) => parseFloat(v))
+                            .filter((v: number) => !isNaN(v)),
+                          'config.process[0].sample.likeness.weights',
+                        )
+                      }
+                      placeholder="1, 1, 1"
+                    />
+                  </div>
+                  <div className="mt-4">
+                    <TextAreaInput
+                      label="Scoring Prompts (one per line)"
+                      value={(jobConfig.config.process[0].sample.likeness?.samples ?? [])
+                        .map((s: any) => (typeof s === 'string' ? s : s.prompt))
+                        .join('\n')}
+                      onChange={value =>
+                        setJobConfig(
+                          value.split('\n').filter((line: string) => line.trim() !== ''),
+                          'config.process[0].sample.likeness.samples',
+                        )
+                      }
+                      placeholder={'full body photo of [trigger] standing, front view, white background\nfull body photo of [trigger] standing, back view, white background'}
+                      rows={4}
+                    />
+                  </div>
+                </>
+              )}
+            </Card>
+          </div>
         </div>
 
         {status === 'success' && <p className="text-green-500 text-center">Training saved successfully!</p>}

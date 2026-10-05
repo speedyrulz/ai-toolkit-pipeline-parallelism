@@ -78,6 +78,49 @@ class SampleItem:
         # only for models that support it, (qwen image edit 2509 for now)
         self.do_cfg_norm: bool = kwargs.get('do_cfg_norm', False)
 
+class LikenessConfig:
+    """Character likeness scoring (toolkit/likeness): after each sample round,
+    the round's images are scored against reference images of the character
+    for face, body shape and body detail likeness by a worker running in a
+    ComfyUI install that has the character-similarity custom nodes."""
+
+    def __init__(self, **kwargs):
+        self.enabled: bool = kwargs.get('enabled', False)
+        # folder of reference images of the character
+        self.reference_folder: str = kwargs.get('reference_folder', '')
+        # ComfyUI root; a \\wsl.localhost\<distro>\... path runs it in WSL
+        self.comfyui_path: str = kwargs.get('comfyui_path', '')
+        # ComfyUI's python; empty = <comfyui_path>/venv
+        self.python: str = kwargs.get('python', '')
+        # cpu keeps the scorer off the training gpus
+        self.device: str = kwargs.get('device', 'cpu')
+        self.cpu_threads: int = int(kwargs.get('cpu_threads', 0))
+        # 'auto' = the bf16 checkpoint on cpu, int8 on gpu
+        self.sam3d_model: str = kwargs.get('sam3d_model', 'auto')
+        self.clip_vision_model: str = kwargs.get('clip_vision_model', 'dinov2_large.safetensors')
+        self.face_library: str = kwargs.get('face_library', 'insightface')
+        self.proportion_tolerance: float = float(kwargs.get('proportion_tolerance', 3.0))
+        self.build_tolerance: float = float(kwargs.get('build_tolerance', 8.0))
+        self.proportion_weight: float = float(kwargs.get('proportion_weight', 0.5))
+        # overall score weights for face, body shape, body detail
+        self.weights: List[float] = [float(w) for w in kwargs.get('weights', [1.0, 1.0, 1.0])]
+        # dedicated scoring prompts (str or dict like a sample item). Rendered
+        # every sample round with fixed seeds. Empty = score the regular samples
+        self.samples: List[Union[str, dict]] = kwargs.get('samples', []) or []
+        # first seed for the scoring prompts (each prompt adds its index);
+        # None = the sample config's seed
+        self.seed: Optional[int] = kwargs.get('seed', None)
+        # how long to wait for queued rounds after training ends
+        self.wait_at_end_minutes: float = float(kwargs.get('wait_at_end_minutes', 30))
+        if self.enabled:
+            if not self.reference_folder:
+                raise ValueError("sample.likeness.reference_folder is required")
+            if not self.comfyui_path:
+                raise ValueError("sample.likeness.comfyui_path is required")
+            if self.device not in ('cpu', 'gpu'):
+                raise ValueError("sample.likeness.device must be 'cpu' or 'gpu'")
+
+
 class SampleConfig:
     def __init__(self, **kwargs):
         self.sampler: str = kwargs.get('sampler', 'ddpm')
@@ -115,7 +158,9 @@ class SampleConfig:
         self.samples = [SampleItem(self, **item) for item in raw_samples]
         # only for models that support it, (qwen image edit 2509 for now)
         self.do_cfg_norm: bool = kwargs.get('do_cfg_norm', False)
-        
+        # character likeness scoring of each sample round
+        self.likeness = LikenessConfig(**(kwargs.get('likeness') or {}))
+
     @property
     def prompts(self):
         # for backwards compatibility as this is checked for length frequently

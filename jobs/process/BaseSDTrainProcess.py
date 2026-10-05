@@ -62,7 +62,7 @@ import gc
 from tqdm import tqdm
 
 from toolkit.config_modules import SaveConfig, LoggingConfig, SampleConfig, NetworkConfig, TrainConfig, ModelConfig, \
-    GenerateImageConfig, EmbeddingConfig, DatasetConfig, preprocess_dataset_raw_config, AdapterConfig, GuidanceConfig, validate_configs, \
+    GenerateImageConfig, SampleItem, EmbeddingConfig, DatasetConfig, preprocess_dataset_raw_config, AdapterConfig, GuidanceConfig, validate_configs, \
     DecoratorConfig
 from toolkit.logging_aitk import create_logger
 from diffusers import FluxTransformer2DModel
@@ -375,16 +375,147 @@ class BaseSDTrainProcess(BaseTrainProcess):
         if self.adapter is not None and isinstance(self.adapter, CustomAdapter):
             self.adapter.is_sampling = True
         
+        likeness_on = (
+            not is_first
+            and step is not None
+            and getattr(self, 'likeness_scorer', None) is not None
+        )
+        files_before = set(os.listdir(sample_folder)) if likeness_on and os.path.isdir(sample_folder) else set()
+
         # send to be generated
         self.sd.generate_images(gen_img_config_list, sampler=sample_config.sampler)
 
-        
+        if likeness_on:
+            self._likeness_sample_round(step, sample_config, sample_folder, files_before)
+
+
         if self.adapter is not None and isinstance(self.adapter, CustomAdapter):
             self.adapter.is_sampling = False
 
         if self.ema is not None:
             self.ema.train()
         print_acc("") # add a line break
+
+    # ------------------------------------------------------------------
+    # Character likeness scoring (toolkit/likeness)
+    # ------------------------------------------------------------------
+
+    def _likeness_start(self):
+        lk = self.sample_config.likeness if self.sample_config is not None else None
+        self.likeness_scorer = None
+        if lk is None or not lk.enabled or not self.accelerator.is_main_process:
+            return
+        from toolkit.likeness.scorer import LikenessScorer
+        scorer = LikenessScorer(lk, os.path.join(self.save_root, 'likeness'))
+        try:
+            scorer.start()
+        except Exception as e:
+            print_acc(f"Likeness scoring disabled, the worker could not start: {e}")
+            return
+        self.likeness_scorer = scorer
+        import atexit
+        atexit.register(scorer.close)
+
+    def _likeness_sample_round(self, step, sample_config, sample_folder, files_before):
+        scorer = self.likeness_scorer
+        lk = sample_config.likeness
+        round_folder = os.path.join(self.save_root, 'likeness', 'samples', f"step_{int(step):09d}")
+        os.makedirs(round_folder, exist_ok=True)
+        image_exts = ('.png', '.jpg', '.jpeg', '.webp')
+
+        if lk.samples:
+            # dedicated scoring prompts with fixed seeds, the same every round
+            base_seed = lk.seed if lk.seed is not None else sample_config.seed
+            configs = []
+            for i, raw in enumerate(lk.samples):
+                item = SampleItem(sample_config, **(raw if isinstance(raw, dict) else {'prompt': raw}))
+                prompt = item.prompt
+                if self.trigger_word is not None:
+                    prompt = self.sd.inject_trigger_into_prompt(
+                        prompt, self.trigger_word, add_if_not_present=False
+                    )
+                ext = sample_config.ext if sample_config.ext in ('png', 'jpg', 'jpeg', 'webp') else 'png'
+                configs.append(GenerateImageConfig(
+                    prompt=prompt,
+                    width=item.width,
+                    height=item.height,
+                    negative_prompt=item.neg,
+                    seed=item.seed if item.seed is not None else base_seed + i,
+                    guidance_scale=item.guidance_scale,
+                    guidance_rescale=sample_config.guidance_rescale,
+                    num_inference_steps=item.sample_steps,
+                    network_multiplier=item.network_multiplier,
+                    output_path=os.path.join(round_folder, f"likeness_{i:02d}.{ext}"),
+                    output_ext=ext,
+                    refiner_start_at=sample_config.refiner_start_at,
+                    extra_values=sample_config.extra_values,
+                    logger=self.logger,
+                ))
+            configs = self.post_process_generate_image_config_list(configs)
+            print_acc(f"Generating {len(configs)} likeness scoring samples")
+            self.sd.generate_images(configs, sampler=sample_config.sampler)
+        else:
+            # score this round's regular samples
+            new_files = sorted(
+                f for f in set(os.listdir(sample_folder)) - files_before
+                if f.lower().endswith(image_exts)
+            )
+            for f in new_files:
+                shutil.copy2(os.path.join(sample_folder, f), os.path.join(round_folder, f))
+
+        if not any(f.lower().endswith(image_exts) for f in os.listdir(round_folder)):
+            print_acc(f"Likeness: no images to score for step {step}")
+            return
+        if not scorer.submit(step, round_folder):
+            print_acc(f"Likeness scoring unavailable: {scorer.failed or 'worker stopped'}")
+            self.likeness_scorer = None
+
+    def _likeness_log_results(self, results):
+        for r in results:
+            step = r.get('step')
+            if 'fatal' in r:
+                print_acc(f"\nLikeness scoring stopped: {r['fatal']} (see likeness/likeness_worker.log)")
+                continue
+            if 'error' in r:
+                print_acc(f"\nLikeness scoring failed for step {step}: {r['error']}")
+                continue
+
+            def fmt(v):
+                return '-' if v is None else f"{v:.1f}"
+
+            print_acc(
+                f"\nLikeness @ step {step}: overall {fmt(r.get('overall'))} | face {fmt(r.get('face'))}"
+                f" | body shape {fmt(r.get('body_shape'))} | body detail {fmt(r.get('body_detail'))}"
+                f"  ({r.get('images')} images, {r.get('seconds', 0):.0f}s)"
+            )
+            metrics = {
+                f'likeness/{k}': r[k]
+                for k in ('overall', 'face', 'body_shape', 'body_detail', 'build', 'proportion')
+                if r.get(k) is not None
+            }
+            if metrics and self.accelerator.is_main_process:
+                if self.writer is not None:
+                    for k, v in metrics.items():
+                        self.writer.add_scalar(k, v, step)
+                # scores arrive after their round; log them against the step
+                # they measure. Called only when nothing else is pending.
+                self.logger.log(metrics)
+                self.logger.commit(step=step)
+
+    def _likeness_poll(self):
+        if getattr(self, 'likeness_scorer', None) is not None:
+            self._likeness_log_results(self.likeness_scorer.poll())
+
+    def _likeness_finish(self):
+        scorer = getattr(self, 'likeness_scorer', None)
+        if scorer is None:
+            return
+        wait_s = self.sample_config.likeness.wait_at_end_minutes * 60
+        self._likeness_log_results(scorer.finish(wait_s))
+        if scorer.pending:
+            print_acc(f"Likeness scoring did not finish for step(s) "
+                      f"{', '.join(str(s) for s in scorer.pending)}")
+        self.likeness_scorer = None
 
     def update_training_metadata(self):
         o_dict = OrderedDict({
@@ -2742,6 +2873,9 @@ class BaseSDTrainProcess(BaseTrainProcess):
             print_acc("Generating first sample from first sample config")
             self.sample(0, is_first=True)
 
+        # character likeness scorer: loads its models in the background
+        self._likeness_start()
+
         # sample first
         if self.train_config.skip_first_sample or self.train_config.disable_sampling:
             print_acc("Skipping first sample due to config setting")
@@ -2818,6 +2952,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
             if self.train_config.do_paramiter_swapping:
                 self.optimizer.optimizer.swap_paramiters()
             self.timer.start('train_loop')
+            self._likeness_poll()
             if flush_next:
                 flush()
                 flush_next = False
@@ -3115,6 +3250,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
         if not self.train_config.disable_sampling:
             self.sample(self.step_num)
             self.logger.commit(step=self.step_num)
+        self._likeness_finish()
         print_acc("")
         if self.accelerator.is_main_process:
             self.logger.finish()
