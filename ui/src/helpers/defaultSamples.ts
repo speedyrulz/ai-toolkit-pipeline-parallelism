@@ -1006,3 +1006,24 @@ export const defaultYue2SampleConfig: SampleConfig = {
   // max seconds per sample; the AR stops earlier when the song ends
   duration: 120,
 };
+
+// OmniVoice: each prompt is the text to speak
+export const defaultOmniVoiceSampleConfig: SampleConfig = {
+  sampler: 'flowmatch',
+  sample_every: 250,
+  sample_start_step: 0,
+  width: 1024,
+  height: 1024,
+  samples: [
+    { prompt: 'Hello there! This is a quick test of my new voice, recorded after a little more training.' },
+    { prompt: 'The weather today is calm and clear, perfect for a long walk by the river.' },
+    { prompt: 'I can not believe it actually worked. Give me a second, let me try that one more time.' },
+  ],
+  neg: '',
+  seed: 42,
+  walk_seed: false,
+  guidance_scale: 2,
+  sample_steps: 32,
+  num_frames: 1,
+  fps: 1,
+};

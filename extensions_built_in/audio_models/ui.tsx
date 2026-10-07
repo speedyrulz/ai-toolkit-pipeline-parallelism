@@ -6,6 +6,7 @@ import {
   defaultSampleConfig,
   defaultAudioSampleConfig,
   defaultYue2SampleConfig,
+  defaultOmniVoiceSampleConfig,
 } from "@/helpers/defaultSamples";
 
 const defaultNameOrPath = "";
@@ -71,6 +72,76 @@ export const AI_TOOLKIT_UI_MODELS: ModelArch[] = [
       "model.low_vram",
       "model.layer_offloading",
     ],
+  },
+  {
+    name: "omnivoice",
+    label: "OmniVoice (TTS)",
+    group: "audio",
+    defaults: {
+      // default updates when [selected, unselected] in the UI
+      "config.process[0].model.name_or_path": ["k2-fsa/OmniVoice", defaultNameOrPath],
+      "config.process[0].model.quantize": [false, false],
+      "config.process[0].model.quantize_te": [false, false],
+      "config.process[0].model.low_vram": [false, false],
+      "config.process[0].train.unload_text_encoder": [false, false],
+      "config.process[0].train.lr": [0.0001, 0.0001],
+      "config.process[0].network.linear": [16, 32],
+      "config.process[0].network.linear_alpha": [32, 32],
+      "config.process[0].sample": [defaultOmniVoiceSampleConfig, defaultSampleConfig],
+      "config.process[0].datasets[x].cache_latents_to_disk": [true, true],
+      // audio has no resolution; every bucket would duplicate the whole dataset
+      "config.process[0].datasets[x].resolution": [[512], [512, 768, 1024]],
+      // the transcript is what the voice is conditioned on; never drop it
+      "config.process[0].datasets[x].caption_dropout_rate": [0, 0.05],
+      "config.process[0].model.model_kwargs": [
+        {
+          language: "en",
+          comfyui_export_dir: "",
+          comfyui_export_every_save: true,
+          comfyui_export_keep: 0,
+          comfyui_export_dtype: "fp32",
+        },
+        {},
+      ],
+    },
+    modelNotes: (
+      <div className="space-y-2">
+        <p>
+          Text-to-speech voice LoRA for OmniVoice. The dataset is a folder of
+          speech clips (wav, mp3, flac, ...), each with a <code>.txt</code>{" "}
+          holding its exact transcript. Clips of about 3 to 15 seconds of one
+          clean voice work best. Keep Cache Latents to Disk on: each clip is
+          tokenized once. Each sample prompt is the text to speak.
+        </p>
+        <p>
+          <b>ComfyUI:</b> the ComfyUI OmniVoice nodes cannot load LoRA files,
+          so set <code>comfyui_export_dir</code> in the model kwargs to your
+          ComfyUI <code>models/omnivoice</code> folder (a{" "}
+          <code>{"\\\\wsl.localhost\\..."}</code> path works). Every save is then
+          also written there as a merged model (the audio tokenizer is
+          linked, not copied) and appears in the nodes' model
+          list. <code>comfyui_export_keep</code> limits how many are kept
+          (0 keeps all); <code>comfyui_export_every_save: false</code> exports
+          only the final save. Exports are written in the background while
+          training continues.
+        </p>
+        <p className="text-amber-400">
+          In the ComfyUI OmniVoice node, set <b>dtype to fp32</b> for trained
+          models. A LoRA&apos;s change to each weight is tiny next to the
+          weight itself: loaded in bf16 (the node&apos;s auto setting), about
+          half of what the LoRA learned rounds away. Exports are saved in fp32
+          (about 3.2 GB) for the same reason.
+        </p>
+        <p>
+          Optional model kwargs: <code>language</code> (e.g. en),{" "}
+          <code>instruct</code> (a voice description used for every clip),
+          and <code>sample_ref_audio</code> + <code>sample_ref_text</code> to
+          voice-clone the samples. Requires the omnivoice package:{" "}
+          <code>pip install omnivoice==0.2.1 --no-deps</code>.
+        </p>
+      </div>
+    ),
+    disableSections: ["network.conv", "model.quantize", "model.quantize_te"],
   },
   {
     name: "yue2",

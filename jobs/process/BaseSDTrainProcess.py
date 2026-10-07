@@ -694,6 +694,10 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     metadata=save_meta,
                     extra_state_dict=embedding_dict
                 )
+                # models can derive extra artifacts from a saved network (e.g.
+                # omnivoice's merged ComfyUI export)
+                if hasattr(self.sd, 'after_network_save'):
+                    self.sd.after_network_save(file_path, self.network, is_final=step is None)
                 self.network.multiplier = prev_multiplier
                 # if we have an embedding as well, pair it with the network
 
