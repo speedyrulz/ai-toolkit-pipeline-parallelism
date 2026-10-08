@@ -538,6 +538,11 @@ class TrainConfig:
         # this will do proper gradient accumulation where you will not see a step until the end of the accumulation
         # the method above will show a step every accumulation
         self.gradient_accumulation = kwargs.get('gradient_accumulation', 1)
+        if self.gradient_accumulation is None or int(self.gradient_accumulation) < 1:
+            # 0 (e.g. a field cleared in the UI) would gather no batches and divide by zero
+            print(f"gradient_accumulation {self.gradient_accumulation!r} is not a batch count, using 1")
+            self.gradient_accumulation = 1
+        self.gradient_accumulation = int(self.gradient_accumulation)
         if self.gradient_accumulation > 1:
             if self.gradient_accumulation_steps != 1:
                 raise ValueError("gradient_accumulation and gradient_accumulation_steps are mutually exclusive")
