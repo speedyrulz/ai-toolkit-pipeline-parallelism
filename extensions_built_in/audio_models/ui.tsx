@@ -145,6 +145,7 @@ export const AI_TOOLKIT_UI_MODELS: ModelArch[] = [
       </div>
     ),
     disableSections: ["network.conv", "model.quantize", "model.quantize_te"],
+    additionalSections: ["validation.audio_folder"],
   },
   {
     name: "qwen3_tts",
@@ -219,6 +220,7 @@ export const AI_TOOLKIT_UI_MODELS: ModelArch[] = [
       </div>
     ),
     disableSections: ["network.conv", "model.quantize", "model.quantize_te"],
+    additionalSections: ["validation.audio_folder"],
   },
   {
     name: "yue2",

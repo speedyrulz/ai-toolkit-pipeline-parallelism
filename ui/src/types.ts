@@ -150,6 +150,9 @@ export interface ValidationItem {
 
 export interface ValidationConfig {
   validation_items: ValidationItem[];
+  /** speech models: folder of held-out clips with transcripts, in place of validation_items */
+  folder_path?: string;
+  caption_ext?: string;
   resolution: number;
   validate_every_n_steps: number;
   validation_sigmas?: number[];
@@ -376,7 +379,7 @@ export interface CaptionProcessConfig {
     layer_offloading?: boolean;
     layer_offloading_percent?: number;
     loras?: CaptionLora[];
-  }
+  };
 }
 
 export interface CaptionConfigObject {

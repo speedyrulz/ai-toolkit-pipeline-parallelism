@@ -405,6 +405,14 @@ class ValidationConfig:
         self.validate_every_n_steps: int = kwargs.get('validate_every_n_steps', 10)
         self.validation_sigmas: List[float] = kwargs.get('validation_sigmas', [1.0, 0.75, 0.5, 0.25])
 
+        # speech models (OmniVoice, Qwen3-TTS): a folder of held-out clips,
+        # each with a caption file holding its transcript, in place of
+        # validation_items. Each clip is scored with the model's training loss
+        # at a fixed seed.
+        self.folder_path: Optional[str] = kwargs.get('folder_path', None) or None
+        self.caption_ext: str = str(kwargs.get('caption_ext', 'txt')).lstrip('.')
+        self.seed: int = int(kwargs.get('seed', 42))
+
         # adaptive learning rate: at every validation, the segment of steps
         # since the previous validation is re-run from a snapshot at lr/factor
         # and lr*factor on the SAME batches and rng, validation loss decides

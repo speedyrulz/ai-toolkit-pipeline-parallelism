@@ -36,6 +36,7 @@ type AdditionalSections =
   | 'model.unconditional_lora_path'
   | 'model.model_kwargs.kv_cache'
   | 'model.model_kwargs.instruction'
+  | 'validation.audio_folder'
   | 'ideogram_4_prompt';
 
 type ModelGroup = 'image' | 'instruction' | 'video' | 'experimental' | 'audio' | 'llm';

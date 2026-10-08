@@ -32,7 +32,7 @@ model_kwargs:
                          job name). Type it as custom_speaker_name in the
                          Custom Voice node.
   ref_audio              file or folder whose clips give the speaker
-                         embedding (default: the dataset folder)
+                         embedding (default: the training dataset folders)
   recipe                 fixed (default) or official (sft_12hz.py as is)
   sub_talker_weight      weight of the code-predictor loss (default 0.3)
   comfyui_export_dir     ComfyUI models/Qwen3-TTS folder to export merged
@@ -287,28 +287,34 @@ class Qwen3TTSTrainModel(BaseAudioModel):
             embeds.append(enc(mel.to(p.device, p.dtype)).float().cpu())
         return torch.cat(embeds).mean(0, keepdim=True)
 
-    def _ref_clips(self, source: str) -> List[str]:
-        if os.path.isfile(source):
-            return [source]
-        clips = sorted(f for f in glob.glob(os.path.join(source, "*")) if f.lower().endswith(_AUDIO_EXT))
+    def _ref_clips(self, sources: List[str]) -> List[str]:
+        clips = []
+        for source in sources:
+            if os.path.isfile(source):
+                clips.append(source)
+            else:
+                clips += sorted(f for f in glob.glob(os.path.join(source, "*")) if f.lower().endswith(_AUDIO_EXT))
         if len(clips) > _MAX_REF_CLIPS:
             step = len(clips) / _MAX_REF_CLIPS
             clips = [clips[int(i * step)] for i in range(_MAX_REF_CLIPS)]
         return clips
 
     def _speaker_embedding(self, batch=None) -> Optional[torch.Tensor]:
+        """Mean speaker-encoder embedding of ref_audio, else of the training
+        dataset folders (set by the trainer), else of the batch's folder. A
+        validation batch never picks the source: its clips are held out."""
         if self._speaker is not None:
             return self._speaker
-        source = self.ref_audio
-        if source is None and batch is not None and batch.file_items:
-            source = os.path.dirname(batch.file_items[0].path)
-        if source is None:
+        sources = [self.ref_audio] if self.ref_audio else list(getattr(self, "train_dataset_folders", None) or [])
+        if not sources and batch is not None and batch.file_items and not getattr(batch, "is_validation", False):
+            sources = [os.path.dirname(batch.file_items[0].path)]
+        if not sources:
             return None
-        clips = self._ref_clips(source)
+        clips = self._ref_clips(sources)
         if not clips:
-            raise ValueError(f"qwen3_tts: no audio found for the speaker embedding in {source}")
+            raise ValueError(f"qwen3_tts: no audio found for the speaker embedding in {sources}")
         self._speaker = self._embed_clips(clips)
-        print_acc(f"qwen3_tts: speaker embedding from {len(clips)} clip(s) in {source}")
+        print_acc(f"qwen3_tts: speaker embedding from {len(clips)} clip(s) in {', '.join(sources)}")
         return self._speaker
 
     # ------------------------------------------------------------------
@@ -340,7 +346,10 @@ class Qwen3TTSTrainModel(BaseAudioModel):
         model = self.model
         talker = model.talker
         dtype = next(talker.parameters()).dtype
-        spk = self._speaker_embedding(batch).to(self.device_torch, dtype)
+        spk = self._speaker_embedding(batch)
+        if spk is None:
+            raise ValueError("qwen3_tts: no speaker embedding source; set model_kwargs.ref_audio")
+        spk = spk.to(self.device_torch, dtype)
         ids = b["input_ids"]
         text_embeds = talker.model.text_embedding(ids[:, :, 0])
         # generation always runs text through text_projection; sft_12hz.py
@@ -423,7 +432,7 @@ class Qwen3TTSTrainModel(BaseAudioModel):
         was_training = model.training
         model.eval()
         try:
-            speaker = ""  # no voice yet (samples before the first step without ref_audio)
+            speaker = ""  # no voice source known: the model's default voice
             if spk is not None:
                 # register the voice the way an exported model carries it
                 weight[SPEAKER_ROW] = spk[0].to(weight.device, weight.dtype)

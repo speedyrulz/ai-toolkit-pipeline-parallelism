@@ -1750,6 +1750,9 @@ class BaseSDTrainProcess(BaseTrainProcess):
             return
         if not self.accelerator.is_main_process:
             return
+        if val_config.folder_path:
+            self._setup_audio_validation(val_config)
+            return
         validation_items = []
         for item in val_config.validation_items:
             if not item.image_path:
@@ -1838,6 +1841,8 @@ class BaseSDTrainProcess(BaseTrainProcess):
             return
         if not self.accelerator.is_main_process:
             return
+        if self._validation_cache.get('kind') == 'audio_llm':
+            return self._validate_audio_llm(val_config)
         device = self.device_torch
         dtype = get_torch_dtype(self.train_config.dtype)
         sigmas = val_config.validation_sigmas
@@ -1896,6 +1901,100 @@ class BaseSDTrainProcess(BaseTrainProcess):
         if was_unet_training:
             self.sd.unet.train()
         return val_loss.item()
+
+    def _setup_audio_validation(self, val_config):
+        """Speech models: encode the held-out clips of val_config.folder_path
+        once (like the latent cache) and keep them with their transcripts."""
+        import torchaudio
+        from toolkit.data_loader import audio_extensions
+        from toolkit.dto import DTO
+
+        if not (getattr(self.sd, 'is_audio_model', False) and getattr(self.sd, 'is_llm', False)):
+            print_acc("Validation folder_path is only supported for speech models (e.g. omnivoice, qwen3_tts); "
+                      "skipping validation")
+            return
+        folder = val_config.folder_path
+        if not os.path.isdir(folder):
+            print_acc(f"Validation folder not found: {folder}; skipping validation")
+            return
+        items = []
+        for name in sorted(os.listdir(folder)):
+            path = os.path.join(folder, name)
+            if not name.lower().endswith(tuple(audio_extensions)):
+                continue
+            caption_path = os.path.splitext(path)[0] + '.' + val_config.caption_ext
+            if not os.path.isfile(caption_path):
+                print_acc(f"Skipping validation clip without a .{val_config.caption_ext} transcript: {name}")
+                continue
+            with open(caption_path, encoding='utf-8') as f:
+                caption = f.read().strip()
+            if caption:
+                items.append((path, caption))
+        if not items:
+            print_acc(f"No validation clips with transcripts in {folder}; skipping validation")
+            return
+        print_acc(f"Encoding {len(items)} validation clips from {folder}")
+        sample_rate = int(getattr(self.sd, 'sample_rate', 48000))
+        cached = []
+        with torch.no_grad():
+            for path, caption in items:
+                waveform, sr = torchaudio.load(path)
+                if sr != sample_rate:
+                    waveform = torchaudio.functional.resample(waveform, sr, sample_rate)
+                latent = self.sd.encode_images(waveform[None].to(self.device_torch, torch.float32))
+                # per-item, as the latent cache stores it (DTO.stack adds the batch dim back)
+                latent = latent.map(lambda t: t.squeeze(0).cpu()) if isinstance(latent, DTO) \
+                    else latent.squeeze(0).detach().cpu()
+                cached.append((latent, caption, path))
+        self._validation_cache = {'kind': 'audio_llm', 'items': cached}
+        flush()
+
+    def _validate_audio_llm(self, val_config):
+        """Mean training loss over the held-out clips, each scored at a fixed
+        seed (OmniVoice draws random masks per call), with the training rng
+        put back afterwards so validation never changes what training does
+        next (adaptive LR replays segments exactly)."""
+        from toolkit.dto import DTO
+
+        model = self.sd.model
+        was_training = model.training
+        model.eval()
+        network = self.network if self.network is not None else BlankNetwork()
+        start_multiplier = network.multiplier
+        network.multiplier = 1.0
+        # the model's own loss logs belong to the training step being logged
+        saved_logs = dict(getattr(self.sd, 'additional_loss_logs', None) or {})
+        rng = {
+            'python': random.getstate(),
+            'numpy': np.random.get_state(),
+            'torch': torch.get_rng_state(),
+            'cuda': torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+        }
+        losses = []
+        try:
+            with torch.no_grad(), network:
+                for i, (latent, caption, path) in enumerate(self._validation_cache['items']):
+                    seed = val_config.seed + i
+                    random.seed(seed)
+                    np.random.seed(seed)
+                    torch.manual_seed(seed)
+                    latents = DTO.stack([latent]) if isinstance(latent, DTO) else latent[None]
+                    batch = _AudioValidationBatch(latents, caption, path)
+                    losses.append(float(self.sd.get_llm_loss(batch).detach().float()))
+        finally:
+            random.setstate(rng['python'])
+            np.random.set_state(rng['numpy'])
+            torch.set_rng_state(rng['torch'])
+            if rng['cuda'] is not None:
+                torch.cuda.set_rng_state_all(rng['cuda'])
+            if hasattr(self.sd, 'additional_loss_logs'):
+                self.sd.additional_loss_logs = saved_logs
+            network.multiplier = start_multiplier
+            if was_training:
+                model.train()
+        val_loss = sum(losses) / len(losses)
+        self.additional_logs['val/loss'] = val_loss
+        return val_loss
 
     # ------------------------------------------------------------------
     # Adaptive learning rate (validation-driven branch search)
@@ -2638,6 +2737,11 @@ class BaseSDTrainProcess(BaseTrainProcess):
         )
         self.lr_scheduler = lr_scheduler
 
+        # the training dataset folders, for models that derive something from
+        # the whole dataset (qwen3_tts: the speaker embedding)
+        self.sd.train_dataset_folders = [
+            d.folder_path for d in (self.datasets or []) if getattr(d, 'folder_path', None)
+        ]
         # cache validation latents and embeddings now, the vae and text encoder
         # may be dumped before the train loop starts
         self.setup_validation()
@@ -3429,3 +3533,22 @@ For more details, including weighting, merging and fusing LoRAs, check the [docu
 
 """
         return readme_content
+
+
+class _AudioFileRef:
+    def __init__(self, path):
+        self.path = path
+
+
+class _AudioValidationBatch:
+    """The parts of a DataLoaderBatchDTO a speech model's get_llm_loss reads."""
+    is_validation = True
+
+    def __init__(self, latents, caption, path):
+        self.latents = latents
+        self.tensor = None
+        self.file_items = [_AudioFileRef(path)]
+        self._captions = [caption]
+
+    def get_caption_list(self, *args, **kwargs):
+        return list(self._captions)
