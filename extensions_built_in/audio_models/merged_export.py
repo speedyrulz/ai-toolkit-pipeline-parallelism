@@ -150,6 +150,7 @@ def write_export(state: dict, lora_path: str, base_path: str, export_dir: str, k
     from safetensors.torch import save_file
 
     t0 = time.time()
+    export_dir = _canonical(export_dir)
     name = os.path.splitext(os.path.basename(lora_path))[0]
     dest = os.path.join(export_dir, name)
     os.makedirs(dest, exist_ok=True)
@@ -205,31 +206,90 @@ def write_export(state: dict, lora_path: str, base_path: str, export_dir: str, k
     return dest
 
 
+def _canonical(path: str) -> str:
+    """A mapped drive letter (or other alias) of a \\\\wsl.localhost share as
+    its UNC path, so WSL destinations are recognised however they are named."""
+    if sys.platform != "win32" or wsl_parts(path) is not None:
+        return path
+    try:
+        real = os.path.realpath(path)
+    except OSError:
+        return path
+    if real.startswith("\\\\?\\UNC\\"):
+        real = "\\\\" + real[8:]
+    elif real.startswith("\\\\?\\"):
+        real = real[4:]
+    return real if wsl_parts(real) is not None else path
+
+
+def _local_fixed_drive(path: str) -> bool:
+    """Junctions only work on a local NTFS disk, not on a network share
+    (a junction made on the WSL share is an empty folder inside WSL)."""
+    import ctypes
+
+    drive = os.path.splitdrive(os.path.abspath(path))[0]
+    if len(drive) != 2 or drive[1] != ":":
+        return False
+    return ctypes.windll.kernel32.GetDriveTypeW(drive + "\\") == 3  # DRIVE_FIXED
+
+
+def _link_works(src: str, dst: str, how: str) -> bool:
+    probe = next((f for f in sorted(os.listdir(src)) if os.path.isfile(os.path.join(src, f))), None)
+    if probe is None:
+        return True
+    if how == "wsl-symlink":
+        distro, dst_linux = wsl_parts(dst)
+        r = subprocess.run(["wsl.exe", "-d", distro, "--", "test", "-f", f"{dst_linux}/{probe}"], capture_output=True)
+        return r.returncode == 0
+    return os.path.isfile(os.path.join(dst, probe))
+
+
+def _unlink(dst: str, how: str):
+    if how == "wsl-symlink":
+        distro, dst_linux = wsl_parts(dst)
+        subprocess.run(["wsl.exe", "-d", distro, "--", "rm", "--", dst_linux], capture_output=True)
+    elif how == "junction":
+        os.rmdir(dst)
+    else:
+        os.unlink(dst)
+
+
 def link_dir(src: str, dst: str) -> str:
-    """Link the big shared folders (the 769 MB audio tokenizer) instead of
-    copying them. Returns how: 'wsl-symlink', 'symlink', 'junction' or 'copy'."""
+    """Link the big shared folders (the audio / speech tokenizer) instead of
+    copying them. Every link is checked from where the model will be loaded;
+    one that does not show the files is removed and the folder copied.
+    Returns how: 'wsl-symlink', 'symlink', 'junction', 'copy' or 'existing'."""
+    dst = _canonical(dst)
     if os.path.lexists(dst):
-        return "existing"
+        if os.path.isdir(dst) and not os.listdir(dst) and not os.path.islink(dst):
+            os.rmdir(dst)  # an empty leftover (e.g. a junction made on the WSL share)
+        else:
+            return "existing"
     dst_wsl = wsl_parts(dst)
+    attempts = []
     if dst_wsl is not None and sys.platform == "win32":
         distro, dst_linux = dst_wsl
         src_linux = to_linux_path(src, distro)
         if src_linux:
-            r = subprocess.run(["wsl.exe", "-d", distro, "--", "ln", "-s", src_linux, dst_linux],
-                               capture_output=True)
-            if r.returncode == 0:
-                return "wsl-symlink"
-    try:
-        os.symlink(src, dst, target_is_directory=True)
-        return "symlink"
-    except OSError:
-        pass
-    if sys.platform == "win32" and dst_wsl is None and wsl_parts(src) is None:
-        # mklink reads a forward slash as a switch
-        r = subprocess.run(["cmd", "/c", "mklink", "/J", os.path.normpath(dst), os.path.normpath(src)],
-                           capture_output=True)
-        if r.returncode == 0:
-            return "junction"
+            attempts.append(("wsl-symlink", ["wsl.exe", "-d", distro, "--", "ln", "-s", src_linux, dst_linux]))
+    # Windows links on a share (a mapped WSL drive among them) can look fine
+    # from Windows and empty from Linux: only make them on a local disk
+    if dst_wsl is None and (sys.platform != "win32" or _local_fixed_drive(dst)):
+        attempts.append(("symlink", None))
+        if sys.platform == "win32" and wsl_parts(src) is None:
+            # mklink reads a forward slash as a switch
+            attempts.append(("junction", ["cmd", "/c", "mklink", "/J", os.path.normpath(dst), os.path.normpath(src)]))
+    for how, cmd in attempts:
+        try:
+            if cmd is None:
+                os.symlink(src, dst, target_is_directory=True)
+            elif subprocess.run(cmd, capture_output=True).returncode != 0:
+                continue
+        except OSError:
+            continue
+        if _link_works(src, dst, how):
+            return how
+        _unlink(dst, how)
     shutil.copytree(src, dst)
     return "copy"
 
