@@ -313,9 +313,20 @@ class ToolkitModuleMixin:
         lora_output_batch_size = lora_output.size(0)
         multiplier_batch_size = multiplier.size(0)
         if lora_output_batch_size != multiplier_batch_size:
-            num_interleaves = lora_output_batch_size // multiplier_batch_size
-            # todo check if this is correct, do we just concat when doing cfg?
-            multiplier = multiplier.repeat_interleave(num_interleaves)
+            if lora_output_batch_size % multiplier_batch_size != 0:
+                # this layer's rows are not the samples (e.g. Qwen3-TTS's code
+                # predictor runs one row per audio frame): only a strength shared
+                # by every sample applies
+                if not bool(torch.all(multiplier == multiplier[0])):
+                    raise ValueError(
+                        f"LoRA layer batch {lora_output_batch_size} does not map to the {multiplier_batch_size} "
+                        "samples, so per-sample network weights cannot be applied to it"
+                    )
+                multiplier = multiplier[:1]
+            else:
+                num_interleaves = lora_output_batch_size // multiplier_batch_size
+                # todo check if this is correct, do we just concat when doing cfg?
+                multiplier = multiplier.repeat_interleave(num_interleaves)
 
         scaled_lora_output = broadcast_and_multiply(lora_output, multiplier)
         scaled_lora_output = scaled_lora_output.to(org_forwarded.dtype)

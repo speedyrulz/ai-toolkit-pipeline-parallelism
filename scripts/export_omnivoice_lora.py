@@ -20,7 +20,7 @@ import os
 import sys
 
 _EXPORT_PY = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "extensions_built_in",
-                          "audio_models", "omnivoice", "export.py")
+                          "audio_models", "merged_export.py")
 
 
 def _load_export_module():

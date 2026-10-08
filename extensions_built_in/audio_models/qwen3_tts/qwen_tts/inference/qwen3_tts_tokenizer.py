@@ -26,9 +26,8 @@ import torch
 from torch.nn.utils.rnn import pad_sequence
 from transformers import AutoConfig, AutoFeatureExtractor, AutoModel
 
+from .._compat import restore_rotary_buffers
 from ..core import (
-    Qwen3TTSTokenizerV1Config,
-    Qwen3TTSTokenizerV1Model,
     Qwen3TTSTokenizerV2Config,
     Qwen3TTSTokenizerV2Model,
 )
@@ -78,14 +77,12 @@ class Qwen3TTSTokenizer:
         """
         inst = cls()
 
-        AutoConfig.register("qwen3_tts_tokenizer_25hz", Qwen3TTSTokenizerV1Config)
-        AutoModel.register(Qwen3TTSTokenizerV1Config, Qwen3TTSTokenizerV1Model)
-
         AutoConfig.register("qwen3_tts_tokenizer_12hz", Qwen3TTSTokenizerV2Config)
         AutoModel.register(Qwen3TTSTokenizerV2Config, Qwen3TTSTokenizerV2Model)
 
         inst.feature_extractor = AutoFeatureExtractor.from_pretrained(pretrained_model_name_or_path)
         inst.model = AutoModel.from_pretrained(pretrained_model_name_or_path, **kwargs)
+        restore_rotary_buffers(inst.model)
         inst.config = inst.model.config
 
         inst.device = getattr(inst.model, "device", None)

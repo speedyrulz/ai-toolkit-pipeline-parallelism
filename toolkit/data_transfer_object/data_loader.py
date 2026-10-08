@@ -9,7 +9,7 @@ import av
             
 from toolkit import image_utils
 from toolkit.basic import get_quick_signature_string
-from toolkit.dto import DTO
+from toolkit.dto import DTO, pad_stack
 from toolkit.dataloader_mixins import (
     CaptionProcessingDTOMixin,
     ImageProcessingDTOMixin,
@@ -272,9 +272,8 @@ class DataLoaderBatchDTO:
             ):
                 # only return a tensor if latents are not cached, or if we are explicitly
                 # loading the raw image alongside the cached latents
-                self.tensor: torch.Tensor = torch.cat(
-                    [x.tensor.unsqueeze(0) for x in self.file_items]
-                )
+                # pad_stack == unsqueeze + cat, padding clips of different lengths
+                self.tensor: torch.Tensor = pad_stack([x.tensor for x in self.file_items])
             # if we have encoded latents, we concatenate them
             self.latents: Union[torch.Tensor, None] = None
             if is_latents_cached:

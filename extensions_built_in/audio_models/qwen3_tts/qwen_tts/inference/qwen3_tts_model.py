@@ -27,6 +27,7 @@ import torch
 from transformers import AutoConfig, AutoModel, AutoProcessor
 
 from ..core.models import Qwen3TTSConfig, Qwen3TTSForConditionalGeneration, Qwen3TTSProcessor
+from .._compat import load_processor
 
 AudioLike = Union[
     str,                     # wav path, URL, base64
@@ -115,7 +116,7 @@ class Qwen3TTSModel:
                 f"AutoModel returned {type(model)}, expected Qwen3TTSForConditionalGeneration. "
             )
 
-        processor = AutoProcessor.from_pretrained(pretrained_model_name_or_path, fix_mistral_regex=True,)
+        processor = load_processor(pretrained_model_name_or_path)
 
         generate_defaults = model.generate_config
         return cls(model=model, processor=processor, generate_defaults=generate_defaults)

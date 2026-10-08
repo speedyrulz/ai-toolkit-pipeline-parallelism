@@ -57,7 +57,7 @@ from toolkit.dto import DTO
 from toolkit.print import print_acc
 
 from ..base_audio_model import BaseAudioModel
-from .export import DTYPES, write_export
+from ..merged_export import DTYPES, merged_state_dict, write_export
 
 DEFAULT_MODEL = "k2-fsa/OmniVoice"
 SAMPLE_RATE = 24000
@@ -79,6 +79,8 @@ class OmniVoiceModel(BaseAudioModel):
     arch = "omnivoice"
     is_llm = True
     sample_rate = SAMPLE_RATE
+    # batches mix clips of any length; get_llm_loss trims the -1 padding
+    audio_mixed_length_batches = True
 
     def __init__(self, device, model_config: ModelConfig, dtype="bf16", custom_pipeline=None,
                  noise_scheduler=None, **kwargs):
@@ -203,7 +205,7 @@ class OmniVoiceModel(BaseAudioModel):
         The tokens ride as an int extra: float casts in the latent cache would
         round codes above 256 in bf16."""
         if image_list.shape[0] != 1:
-            raise ValueError("omnivoice encodes one clip at a time (enable latent caching, batch_size 1)")
+            raise ValueError("omnivoice encodes one clip at a time: enable Cache Latents for this dataset")
         wav = image_list[0].float()
         wav = wav.mean(0) if wav.shape[0] > 1 else wav[0]
         fe = self.model.feature_extractor
@@ -231,12 +233,16 @@ class OmniVoiceModel(BaseAudioModel):
         captions = batch.get_caption_list()
         samples = []
         for i in range(tokens.shape[0]):
+            tok = tokens[i]
+            # clips of a batch are padded to the longest with -1 (DTO.stack)
+            real_len = int((tok != -1).reshape(-1, tok.shape[-1]).all(0).sum())
+            tok = tok[..., :real_len]
             label = {"text": captions[i].strip()}
             if self.language:
                 label["language_id"] = self.language
             if self.instruct:
                 label["instruct"] = self.instruct
-            samples.append(self.processor({"audio_tokens": tokens[i].long().cpu(), "label": label}))
+            samples.append(self.processor({"audio_tokens": tok.long().cpu(), "label": label}))
         collated = PaddingDataCollator(self.processor, batch_tokens=0)(samples)
         collated = {k: v.to(self.device_torch) for k, v in collated.items()}
         out = self.model(
@@ -313,42 +319,9 @@ class OmniVoiceModel(BaseAudioModel):
         except Exception as e:  # an export failure must never stop training
             print_acc(f"omnivoice: ComfyUI export failed: {type(e).__name__}: {e}")
 
-    @torch.no_grad()
     def _merged_state_dict(self, network) -> dict:
-        """Base weights with every LoRA delta folded in, computed on stand-in
-        copies of the wrapped layers so the live (frozen) weights are never
-        merged in and out (bf16 round trips would drift them)."""
-        names = {id(m): n for n, m in self.model.named_modules()}
-        dt = self.export_dtype
-        merged = {k: (v.detach().to("cpu", dt) if v.is_floating_point() else v.detach().cpu()).clone()
-                  for k, v in self.model.state_dict().items()}
-        prev_mult = network.multiplier
-        network.multiplier = 1.0
-        network._update_torch_multiplier()
-        try:
-            for module in network.get_all_modules():
-                org = module.org_module[0]
-                name = names.get(id(org))
-                if name is None:
-                    continue
-                stand_in = torch.nn.Linear(org.in_features, org.out_features, bias=org.bias is not None,
-                                           device=org.weight.device, dtype=torch.float32)
-                stand_in.weight.copy_(org.weight.float())
-                if org.bias is not None:
-                    stand_in.bias.copy_(org.bias.float())
-                module.org_module[0] = stand_in
-                prev_merged = getattr(module, "is_merged", None)
-                try:
-                    module.merge_in(1.0)
-                finally:
-                    module.org_module[0] = org
-                    if prev_merged is not None:
-                        module.is_merged = prev_merged
-                merged[f"{name}.weight"] = stand_in.weight.detach().to("cpu", dt)
-        finally:
-            network.multiplier = prev_mult
-            network._update_torch_multiplier()
-        return merged
+        return merged_state_dict(self.model, network, self.export_dtype,
+                                 os.path.join(self.base_path, "model.safetensors"))
 
     def _export_merged(self, lora_path: str, network, wait: bool = False):
         # the merge reads the live LoRA weights, so it runs now (a few seconds);

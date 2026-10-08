@@ -4,6 +4,30 @@ import torch
 DISK_PREFIX = "dto."
 
 
+def pad_stack(tensors):
+    """torch.stack, padding ragged items at the end of every mismatched dim:
+    floats with 0, integers with -1 (never a valid token id, so a model can
+    find the real length), bools with False. Same-shape items stack as before."""
+    shape = tensors[0].shape
+    if all(t.shape == shape for t in tensors[1:]):
+        return torch.cat([t.unsqueeze(0) for t in tensors], dim=0)
+    if any(t.dim() != tensors[0].dim() for t in tensors):
+        raise ValueError(f"cannot batch tensors of different ranks: {[tuple(t.shape) for t in tensors]}")
+    target = [max(t.shape[d] for t in tensors) for d in range(tensors[0].dim())]
+    out = []
+    for t in tensors:
+        if t.dtype == torch.bool:
+            fill = False
+        elif t.is_floating_point() or t.is_complex():
+            fill = 0
+        else:
+            fill = -1
+        padded = t.new_full(target, fill)
+        padded[tuple(slice(0, n) for n in t.shape)] = t
+        out.append(padded.unsqueeze(0))
+    return torch.cat(out, dim=0)
+
+
 def _unwrap(value):
     """Recursively convert any DTO in value back to a plain torch.Tensor.
     Internal: everywhere else, use `dto.tensor`."""
@@ -159,8 +183,9 @@ class DTO(torch.Tensor):
     def stack(cls, items):
         """Collate per-item latents into a batch: unsqueeze(0) + cat. A tensor
         extra missing on some items is zero-filled there (a missing stream is
-        silence). Returns a plain tensor when no item carries extras."""
-        base = torch.cat([_unwrap(x).unsqueeze(0) for x in items], dim=0)
+        silence). Items of different lengths are padded (see pad_stack).
+        Returns a plain tensor when no item carries extras."""
+        base = pad_stack([_unwrap(x) for x in items])
         keys = []
         for x in items:
             if isinstance(x, cls):
@@ -172,12 +197,8 @@ class DTO(torch.Tensor):
             vals = [x.get(k) if isinstance(x, cls) else None for x in items]
             present = [v for v in vals if v is not None]
             if all(torch.is_tensor(v) for v in present):
-                extras[k] = torch.cat(
-                    [
-                        (v if v is not None else torch.zeros_like(present[0])).unsqueeze(0)
-                        for v in vals
-                    ],
-                    dim=0,
+                extras[k] = pad_stack(
+                    [v if v is not None else torch.zeros_like(present[0]) for v in vals]
                 )
             elif all(v == present[0] for v in present[1:]):
                 extras[k] = present[0]

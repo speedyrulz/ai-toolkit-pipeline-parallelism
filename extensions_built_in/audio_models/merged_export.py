@@ -1,13 +1,14 @@
-"""Merged-model export of OmniVoice LoRAs for ComfyUI.
+"""Merged-model export of audio-model LoRAs for ComfyUI.
 
-The ComfyUI-OmniVoice-TTS nodes cannot load LoRA files; they list every
-folder in ``models/omnivoice`` that holds a model. An export is such a folder:
-the base model's files with the LoRA folded into ``model.safetensors``, and the
-769 MB audio tokenizer linked rather than copied.
+The ComfyUI OmniVoice and Qwen3-TTS nodes cannot load LoRA files; they load a
+model folder. An export is such a folder: the base model's files with the LoRA
+folded into ``model.safetensors``, and the big shared sub-models (OmniVoice's
+audio tokenizer, Qwen3-TTS's speech tokenizer) linked rather than copied.
 
-Used by the trainer after each save (``comfyui_export_dir``) and, for LoRAs
-that are already trained, by ``scripts/export_omnivoice_lora.py``. Has no
-toolkit imports so the script stays light.
+Used by the trainers after each save (``comfyui_export_dir``) and, for LoRAs
+that are already trained, by ``scripts/export_omnivoice_lora.py`` and
+``scripts/export_qwen3_tts_lora.py``. Has no toolkit imports so the scripts
+stay light.
 """
 
 import glob
@@ -24,6 +25,7 @@ import torch
 
 EXPORT_MARKER = "aitk_omnivoice_export.json"
 # files of a model folder that are copied (small) or linked (large) on export
+# (defaults: OmniVoice)
 LINK_DIRS = ("audio_tokenizer",)
 SKIP_FILES = ("model.safetensors", "README.md", ".gitattributes")
 DTYPES = {"fp32": torch.float32, "float32": torch.float32, "fp16": torch.float16,
@@ -51,17 +53,22 @@ def to_linux_path(path: str, distro: str) -> Optional[str]:
 
 
 @torch.no_grad()
-def merge_lora_file(base_path: str, lora_path: str, dtype: torch.dtype = torch.float32) -> dict:
+def merge_lora_file(base_path: str, lora_path: str, dtype: torch.dtype = torch.float32,
+                    skip_prefixes=()) -> dict:
     """Base model.safetensors with a saved LoRA file folded in. Keys are
     relative to the OmniVoice root (llm.layers.N.self_attn.q_proj...). PEFT
     format (lora_A/lora_B) carries no alpha, so its scale is 1; kohya format
-    (lora_down/lora_up/.alpha) uses alpha / rank."""
+    (lora_down/lora_up/.alpha) uses alpha / rank. Keys starting with one of
+    ``skip_prefixes`` (non-LoRA data a model keeps in its LoRA file) are left
+    for the caller."""
     from safetensors.torch import load_file
 
     base = load_file(os.path.join(base_path, "model.safetensors"))
     lora = load_file(lora_path)
     modules = set()
     for k in lora:
+        if k.startswith(tuple(skip_prefixes)):
+            continue
         m = re.match(r"^(.*)\.(lora_A|lora_B|lora_down|lora_up)\.weight$", k)
         if m:
             modules.add(m.group(1))
@@ -84,10 +91,62 @@ def merge_lora_file(base_path: str, lora_path: str, dtype: torch.dtype = torch.f
     return {k: (v.to(dtype) if v.is_floating_point() else v) for k, v in base.items()}
 
 
+@torch.no_grad()
+def merged_state_dict(model, network, dtype: torch.dtype = torch.float32,
+                      base_weights_file: Optional[str] = None) -> dict:
+    """``model``'s weights with every LoRA delta of the (live, trained)
+    ``network`` folded in, cast to ``dtype``. Computed on fp32 stand-in copies
+    of the wrapped layers so the live frozen weights are never merged in and
+    out here. The base weights come from ``base_weights_file`` when given: the
+    trainer's sample rounds merge the LoRA into the bf16 model and back out,
+    and each round trip moves some live base weights by a bf16 step."""
+    names = {id(m): n for n, m in model.named_modules()}
+    dt = dtype
+    base = {}
+    if base_weights_file:
+        from safetensors.torch import load_file
+
+        base = load_file(base_weights_file)
+    merged = {}
+    for k, v in model.state_dict().items():
+        v = base.get(k, v)
+        merged[k] = (v.detach().to("cpu", dt) if v.is_floating_point() else v.detach().cpu()).clone()
+    prev_mult = network.multiplier
+    network.multiplier = 1.0
+    network._update_torch_multiplier()
+    try:
+        for module in network.get_all_modules():
+            org = module.org_module[0]
+            name = names.get(id(org))
+            if name is None:
+                continue
+            stand_in = torch.nn.Linear(org.in_features, org.out_features, bias=org.bias is not None,
+                                       device=org.weight.device, dtype=torch.float32)
+            stand_in.weight.copy_(base.get(f"{name}.weight", org.weight).float())
+            if org.bias is not None:
+                stand_in.bias.copy_(base.get(f"{name}.bias", org.bias).float())
+            module.org_module[0] = stand_in
+            prev_merged = getattr(module, "is_merged", None)
+            try:
+                module.merge_in(1.0)
+            finally:
+                module.org_module[0] = org
+                if prev_merged is not None:
+                    module.is_merged = prev_merged
+            merged[f"{name}.weight"] = stand_in.weight.detach().to("cpu", dt)
+    finally:
+        network.multiplier = prev_mult
+        network._update_torch_multiplier()
+    return merged
+
+
 def write_export(state: dict, lora_path: str, base_path: str, export_dir: str, keep: int = 0,
-                 log: Callable[[str], None] = print) -> str:
+                 log: Callable[[str], None] = print, link_dirs=LINK_DIRS, skip_files=SKIP_FILES,
+                 edit_files: Optional[dict] = None) -> str:
     """Write ``state`` as a model folder named after the LoRA file into
-    ``export_dir``. Returns the folder."""
+    ``export_dir``. ``edit_files`` maps a copied file's name to a function
+    taking and returning its text (e.g. a config.json change). Returns the
+    folder."""
     from safetensors.torch import save_file
 
     t0 = time.time()
@@ -124,17 +183,23 @@ def write_export(state: dict, lora_path: str, base_path: str, export_dir: str, k
     written = ["model.safetensors"]
     for entry in sorted(os.listdir(base_path)):
         src = os.path.join(base_path, entry)
-        if os.path.isfile(src) and entry not in SKIP_FILES and not entry.startswith("."):
-            shutil.copy2(src, os.path.join(dest, entry))
+        if os.path.isfile(src) and entry not in skip_files and not entry.startswith("."):
+            if edit_files and entry in edit_files:
+                with open(src, encoding="utf-8") as f:
+                    text = edit_files[entry](f.read())
+                with open(os.path.join(dest, entry), "w", encoding="utf-8") as f:
+                    f.write(text)
+            else:
+                shutil.copy2(src, os.path.join(dest, entry))
             written.append(entry)
     linked = {}
-    for d in LINK_DIRS:
+    for d in link_dirs:
         src = os.path.join(base_path, d)
         if os.path.isdir(src):
             linked[d] = link_dir(src, os.path.join(dest, d))
     with open(os.path.join(dest, EXPORT_MARKER), "w", encoding="utf-8") as f:
         json.dump({"source_lora": os.path.abspath(lora_path), "files": written, "dirs": linked}, f, indent=2)
-    log(f"omnivoice: exported merged model to {dest} ({time.time() - t0:.0f}s)")
+    log(f"exported merged model to {dest} ({time.time() - t0:.0f}s)")
     if keep > 0:
         prune_exports(export_dir, name, keep, log)
     return dest
@@ -160,7 +225,9 @@ def link_dir(src: str, dst: str) -> str:
     except OSError:
         pass
     if sys.platform == "win32" and dst_wsl is None and wsl_parts(src) is None:
-        r = subprocess.run(["cmd", "/c", "mklink", "/J", dst, src], capture_output=True)
+        # mklink reads a forward slash as a switch
+        r = subprocess.run(["cmd", "/c", "mklink", "/J", os.path.normpath(dst), os.path.normpath(src)],
+                           capture_output=True)
         if r.returncode == 0:
             return "junction"
     shutil.copytree(src, dst)
@@ -197,6 +264,6 @@ def prune_exports(export_dir: str, current: str, keep: int, log: Callable[[str],
                     shutil.rmtree(p)
             os.remove(os.path.join(folder, EXPORT_MARKER))
             os.rmdir(folder)
-            log(f"omnivoice: removed old export {os.path.basename(folder)}")
+            log(f"removed old export {os.path.basename(folder)}")
         except Exception as e:
-            log(f"omnivoice: could not remove old export {folder}: {e}")
+            log(f"could not remove old export {folder}: {e}")

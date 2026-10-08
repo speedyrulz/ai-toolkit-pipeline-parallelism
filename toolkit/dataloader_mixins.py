@@ -235,7 +235,12 @@ class BucketsMixin:
         for idx, file_item in enumerate(file_list):
             file_item: 'FileItemDTO' = file_item
             if file_item.is_audio_model:
-                bucket_key = f"{file_item.width}ms"
+                if getattr(getattr(self, 'sd', None), 'audio_mixed_length_batches', False):
+                    # speech models trim each clip of a padded batch themselves,
+                    # so clips of any length share one bucket
+                    bucket_key = "all lengths"
+                else:
+                    bucket_key = f"{file_item.width}ms"
                 if bucket_key not in self.buckets:
                     self.buckets[bucket_key] = Bucket(file_item.width, 1)
                 self.buckets[bucket_key].file_list_idx.append(idx)

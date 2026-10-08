@@ -35,14 +35,15 @@ from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
 from transformers.modeling_layers import GradientCheckpointingLayer
 from transformers.modeling_outputs import (BaseModelOutputWithPast,
                                            CausalLMOutputWithPast, ModelOutput)
-from transformers.modeling_rope_utils import (ROPE_INIT_FUNCTIONS,
-                                              dynamic_rope_update)
+from transformers.modeling_rope_utils import dynamic_rope_update
 from transformers.modeling_utils import (ALL_ATTENTION_FUNCTIONS,
                                          PreTrainedModel)
 from transformers.processing_utils import Unpack
 from transformers.utils import can_return_tuple, logging
 from transformers.utils.hub import cached_file
 
+from ..._compat import (CachePositionMixin, init_normal_, init_ones_, init_padding_row_, init_zeros_,
+                       restore_rotary_buffers, rope_init_fn)
 from ...inference.qwen3_tts_tokenizer import Qwen3TTSTokenizer
 from .configuration_qwen3_tts import (Qwen3TTSConfig,
                                       Qwen3TTSSpeakerEncoderConfig,
@@ -482,18 +483,17 @@ class Qwen3TTSPreTrainedModel(PreTrainedModel):
         std = self.config.initializer_range if hasattr(self.config, "initializer_range") else 0.02
 
         if isinstance(module, (nn.Linear, nn.Conv1d, nn.Conv3d, nn.ConvTranspose1d)):
-            module.weight.data.normal_(mean=0.0, std=std)
+            init_normal_(module.weight, std)
             if module.bias is not None:
-                module.bias.data.zero_()
+                init_zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
-            module.weight.data.normal_(mean=0.0, std=std)
-            if module.padding_idx is not None:
-                module.weight.data[module.padding_idx].zero_()
+            init_normal_(module.weight, std)
+            init_padding_row_(module)
         elif isinstance(module, nn.LayerNorm):
             if module.weight is not None:
-                module.weight.data.fill_(1.0)
+                init_ones_(module.weight)
             if module.bias is not None:
-                module.bias.data.zero_()
+                init_zeros_(module.bias)
 
 
 class Qwen3TTSTalkerTextPreTrainedModel(PreTrainedModel):
@@ -512,15 +512,14 @@ class Qwen3TTSTalkerTextPreTrainedModel(PreTrainedModel):
     def _init_weights(self, module):
         std = self.config.initializer_range
         if isinstance(module, nn.Linear):
-            module.weight.data.normal_(mean=0.0, std=std)
+            init_normal_(module.weight, std)
             if module.bias is not None:
-                module.bias.data.zero_()
+                init_zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
-            module.weight.data.normal_(mean=0.0, std=std)
-            if module.padding_idx is not None:
-                module.weight.data[module.padding_idx].zero_()
+            init_normal_(module.weight, std)
+            init_padding_row_(module)
         elif isinstance(module, Qwen3TTSRMSNorm):
-            module.weight.data.fill_(1.0)
+            init_ones_(module.weight)
 
 
 class Qwen3TTSTalkerRotaryEmbedding(nn.Module):
@@ -535,7 +534,7 @@ class Qwen3TTSTalkerRotaryEmbedding(nn.Module):
         self.original_max_seq_len = config.max_position_embeddings
 
         self.config = config
-        self.rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type]
+        self.rope_init_fn = rope_init_fn(self.rope_type)
 
         inv_freq, self.attention_scaling = self.rope_init_fn(self.config, device)
         self.register_buffer("inv_freq", inv_freq, persistent=False)
@@ -570,7 +569,7 @@ class Qwen3TTSRotaryEmbedding(nn.Module):
         self.original_max_seq_len = config.max_position_embeddings
 
         self.config = config
-        self.rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type]
+        self.rope_init_fn = rope_init_fn(self.rope_type)
 
         inv_freq, self.attention_scaling = self.rope_init_fn(self.config, device)
         self.register_buffer("inv_freq", inv_freq, persistent=False)
@@ -1018,7 +1017,7 @@ class Qwen3TTSTalkerCodePredictorModel(Qwen3TTSPreTrainedModel):
 
     def __init__(self, config: Qwen3TTSTalkerCodePredictorConfig, embedding_dim: int):
         super().__init__(config)
-        self.padding_idx = config.pad_token_id
+        self.padding_idx = getattr(config, "pad_token_id", None)
         self.vocab_size = config.vocab_size
         self.layers = nn.ModuleList(
             [Qwen3TTSDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
@@ -1153,7 +1152,7 @@ class Qwen3TTSTalkerCodePredictorModel(Qwen3TTSPreTrainedModel):
         )
 
 
-class Qwen3TTSTalkerCodePredictorModelForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin):
+class Qwen3TTSTalkerCodePredictorModelForConditionalGeneration(CachePositionMixin, Qwen3TTSPreTrainedModel, GenerationMixin):
     _tied_weights_keys = ["lm_head.weight"]
     _tp_plan = {"lm_head": "colwise_rep"}
     _pp_plan = {"lm_head": (["hidden_states"], ["logits"])}
@@ -1430,7 +1429,7 @@ class Qwen3TTSTalkerModel(Qwen3TTSTalkerTextPreTrainedModel):
 
     def __init__(self, config):
         super().__init__(config)
-        self.padding_idx = config.pad_token_id
+        self.padding_idx = getattr(config, "pad_token_id", None)
         self.vocab_size = config.vocab_size
         self.layers = nn.ModuleList(
             [Qwen3TTSTalkerDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
@@ -1561,7 +1560,7 @@ class Qwen3TTSTalkerModel(Qwen3TTSTalkerTextPreTrainedModel):
         )
 
 
-class Qwen3TTSTalkerForConditionalGeneration(Qwen3TTSTalkerTextPreTrainedModel, GenerationMixin):
+class Qwen3TTSTalkerForConditionalGeneration(CachePositionMixin, Qwen3TTSTalkerTextPreTrainedModel, GenerationMixin):
     _tied_weights_keys = ["lm_head.weight"]
     _tp_plan = {"lm_head": "colwise_rep"}
     _pp_plan = {"lm_head": (["hidden_states"], ["logits"])}
@@ -1888,6 +1887,7 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
             attn_implementation=requested_attn_implementation,
             **kwargs,
         )
+        restore_rotary_buffers(model)
         if not local_files_only and not os.path.isdir(pretrained_model_name_or_path):
             download_cache_dir = kwargs.get("cache_dir", cache_dir)
             download_revision = kwargs.get("revision", revision)

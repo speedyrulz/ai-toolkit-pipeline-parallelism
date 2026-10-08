@@ -7,6 +7,7 @@ import {
   defaultAudioSampleConfig,
   defaultYue2SampleConfig,
   defaultOmniVoiceSampleConfig,
+  defaultQwen3TTSSampleConfig,
 } from "@/helpers/defaultSamples";
 
 const defaultNameOrPath = "";
@@ -140,6 +141,80 @@ export const AI_TOOLKIT_UI_MODELS: ModelArch[] = [
           and <code>sample_ref_audio</code> + <code>sample_ref_text</code> to
           voice-clone the samples. Requires the omnivoice package:{" "}
           <code>pip install omnivoice==0.2.1 --no-deps</code>.
+        </p>
+      </div>
+    ),
+    disableSections: ["network.conv", "model.quantize", "model.quantize_te"],
+  },
+  {
+    name: "qwen3_tts",
+    label: "Qwen3-TTS (custom voice)",
+    group: "audio",
+    defaults: {
+      // default updates when [selected, unselected] in the UI
+      "config.process[0].model.name_or_path": ["Qwen/Qwen3-TTS-12Hz-1.7B-Base", defaultNameOrPath],
+      "config.process[0].model.quantize": [false, false],
+      "config.process[0].model.quantize_te": [false, false],
+      "config.process[0].model.low_vram": [false, false],
+      "config.process[0].train.unload_text_encoder": [false, false],
+      "config.process[0].train.lr": [0.0001, 0.0001],
+      "config.process[0].network.linear": [16, 32],
+      "config.process[0].network.linear_alpha": [16, 32],
+      "config.process[0].save.dtype": ["fp32", "bf16"],
+      "config.process[0].sample": [defaultQwen3TTSSampleConfig, defaultSampleConfig],
+      "config.process[0].datasets[x].cache_latents_to_disk": [true, true],
+      // audio has no resolution; every bucket would duplicate the whole dataset
+      "config.process[0].datasets[x].resolution": [[512], [512, 768, 1024]],
+      // the transcript is what the voice reads; never drop it
+      "config.process[0].datasets[x].caption_dropout_rate": [0, 0.05],
+      "config.process[0].model.model_kwargs": [
+        {
+          speaker_name: "",
+          ref_audio: "",
+          recipe: "fixed",
+          comfyui_export_dir: "",
+          comfyui_export_every_save: true,
+          comfyui_export_keep: 3,
+          comfyui_export_dtype: "fp32",
+        },
+        {},
+      ],
+    },
+    modelNotes: (
+      <div className="space-y-2">
+        <p>
+          Custom-voice LoRA for Qwen3-TTS (use a <b>Base</b> model: 1.7B or
+          0.6B). The dataset is a folder of speech clips (wav, mp3, flac, ...)
+          of one voice, each with a <code>.txt</code> holding its exact
+          transcript. Keep Cache Latents to Disk on. Each sample prompt is
+          the text to speak in the trained voice.
+        </p>
+        <p>
+          The voice is stored as a named speaker, like the ComfyUI-Qwen3-TTS
+          Finetune node does: <code>speaker_name</code> (default: the job
+          name). Its speaker embedding is averaged over{" "}
+          <code>ref_audio</code> (a clip or folder; default: the dataset
+          folder).
+        </p>
+        <p>
+          <b>ComfyUI:</b> the Qwen3-TTS nodes cannot load LoRA files, so set{" "}
+          <code>comfyui_export_dir</code> to your ComfyUI{" "}
+          <code>models/Qwen3-TTS</code> folder (a{" "}
+          <code>{"\\\\wsl.localhost\\..."}</code> path works). Each save is
+          also written there as a merged model (the speech tokenizer is
+          linked, not copied). Load it with the <b>Qwen3-TTS Loader</b>:{" "}
+          <code>local_model_path</code> = the exported folder,{" "}
+          <b>precision fp32</b>; then the <b>Custom Voice</b> node with{" "}
+          <code>custom_speaker_name</code> = the speaker name and language
+          Auto. Exports are fp32 (about 7.7 GB for 1.7B), so keep{" "}
+          <code>comfyui_export_keep</code> small. A LoRA can be exported later
+          with <code>python scripts/export_qwen3_tts_lora.py</code>.
+        </p>
+        <p>
+          <code>recipe: fixed</code> trains what generation runs. Qwen&apos;s
+          sft_12hz.py (which the ComfyUI pack copies) skips the talker&apos;s
+          text projection and shifts its labels twice;{" "}
+          <code>recipe: official</code> reproduces it exactly.
         </p>
       </div>
     ),
