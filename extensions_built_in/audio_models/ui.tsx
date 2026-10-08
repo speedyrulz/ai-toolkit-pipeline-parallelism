@@ -123,7 +123,9 @@ export const AI_TOOLKIT_UI_MODELS: ModelArch[] = [
           list. <code>comfyui_export_keep</code> limits how many are kept
           (0 keeps all); <code>comfyui_export_every_save: false</code> exports
           only the final save. Exports are written in the background while
-          training continues.
+          training continues. With it left empty only LoRA files are saved;
+          export one later with{" "}
+          <code>python scripts/export_omnivoice_lora.py &lt;lora&gt; --dest &lt;folder&gt;</code>.
         </p>
         <p className="text-amber-400">
           In the ComfyUI OmniVoice node, set <b>dtype to fp32</b> for trained

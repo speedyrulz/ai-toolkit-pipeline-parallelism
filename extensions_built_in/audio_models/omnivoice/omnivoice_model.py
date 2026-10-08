@@ -31,8 +31,9 @@ model_kwargs:
   instruct_ratio         chance the instruct text is shown
   only_instruct_ratio    chance an instruct step drops the audio prompt
   comfyui_export_dir     ComfyUI models/omnivoice folder to export merged
-                         models into ("" = no export). \\\\wsl.localhost
-                         paths work.
+                         models into ("" = no export; a saved LoRA can be
+                         exported later with scripts/export_omnivoice_lora.py).
+                         \\\\wsl.localhost paths work.
   comfyui_export_every_save   export at every save (default true) or only
                          the final save
   comfyui_export_keep    exports of this job to keep (0 = all, default 0)
@@ -44,14 +45,9 @@ model_kwargs:
   sample_ref_audio + sample_ref_text  voice-clone the samples from this clip
 """
 
-import glob
-import json
+
 import os
-import re
-import shutil
-import subprocess
-import sys
-import time
+import threading
 from typing import List, Optional
 
 import torch
@@ -61,17 +57,12 @@ from toolkit.dto import DTO
 from toolkit.print import print_acc
 
 from ..base_audio_model import BaseAudioModel
+from .export import DTYPES, write_export
 
 DEFAULT_MODEL = "k2-fsa/OmniVoice"
 SAMPLE_RATE = 24000
 # training samples are written at the trainer's audio rate
 SAVE_SAMPLE_RATE = 48000
-EXPORT_MARKER = "aitk_omnivoice_export.json"
-# files of a model folder that are copied (small) or linked (large) on export
-_LINK_DIRS = ("audio_tokenizer",)
-_SKIP_FILES = ("model.safetensors", "README.md", ".gitattributes")
-
-_WSL_UNC = re.compile(r"^[\\/]{2}wsl(?:\.localhost|\$)[\\/]+([^\\/]+)[\\/]*(.*)$", re.IGNORECASE)
 
 
 def _require_omnivoice():
@@ -82,24 +73,6 @@ def _require_omnivoice():
             "The omnivoice package is required for OmniVoice training. Install it without its "
             "dependencies (it pins an old torch): pip install omnivoice==0.2.1 --no-deps"
         ) from e
-
-
-def _wsl_parts(path: str):
-    """(distro, linux_path) for a \\\\wsl.localhost path, else None."""
-    m = _WSL_UNC.match(path)
-    if not m:
-        return None
-    return m.group(1), "/" + m.group(2).replace("\\", "/").rstrip("/")
-
-
-def _to_linux_path(path: str, distro: str) -> Optional[str]:
-    parts = _wsl_parts(path)
-    if parts is not None:
-        return parts[1] if parts[0].lower() == distro.lower() else None
-    drive, rest = os.path.splitdrive(os.path.abspath(path))
-    if drive and drive[1:] == ":":
-        return f"/mnt/{drive[0].lower()}" + rest.replace("\\", "/")
-    return None
 
 
 class OmniVoiceModel(BaseAudioModel):
@@ -127,9 +100,7 @@ class OmniVoiceModel(BaseAudioModel):
         self.export_dir: str = str(kw.get("comfyui_export_dir", "") or "")
         self.export_every_save = bool(kw.get("comfyui_export_every_save", True))
         self.export_keep = int(kw.get("comfyui_export_keep", 0))
-        self.export_dtype = {"fp32": torch.float32, "float32": torch.float32, "fp16": torch.float16,
-                             "float16": torch.float16, "bf16": torch.bfloat16, "bfloat16": torch.bfloat16}[
-            str(kw.get("comfyui_export_dtype", "fp32")).lower()]
+        self.export_dtype = DTYPES[str(kw.get("comfyui_export_dtype", "fp32")).lower()]
         # one export writes in the background while training continues
         self._export_thread = None
         self.sample_language = kw.get("sample_language", self.language)
@@ -202,6 +173,11 @@ class OmniVoiceModel(BaseAudioModel):
         self.vae = None
         self.pipeline = self
         self.print_and_status_update("Model Loaded")
+        if not self.export_dir:
+            print_acc("omnivoice: comfyui_export_dir is empty, so saves are LoRA files only and will not "
+                      "appear in ComfyUI (its OmniVoice nodes cannot load LoRAs). Set comfyui_export_dir in "
+                      "the model kwargs, or export a finished LoRA later with "
+                      "scripts/export_omnivoice_lora.py")
 
     def get_transformer_block_names(self) -> Optional[List[str]]:
         return ["llm.layers"]
@@ -375,8 +351,6 @@ class OmniVoiceModel(BaseAudioModel):
         return merged
 
     def _export_merged(self, lora_path: str, network, wait: bool = False):
-        import threading
-
         # the merge reads the live LoRA weights, so it runs now (a few seconds);
         # writing the ~3 GB folder over a network share does not need to
         # block training
@@ -395,117 +369,6 @@ class OmniVoiceModel(BaseAudioModel):
 
     def _write_export(self, lora_path: str, state: dict):
         try:
-            self._write_export_inner(lora_path, state)
+            write_export(state, lora_path, self.base_path, self.export_dir, self.export_keep, print_acc)
         except Exception as e:
             print_acc(f"omnivoice: ComfyUI export failed: {type(e).__name__}: {e}")
-
-    def _write_export_inner(self, lora_path: str, state: dict):
-        from safetensors.torch import save_file
-
-        t0 = time.time()
-        name = os.path.splitext(os.path.basename(lora_path))[0]
-        dest = os.path.join(self.export_dir, name)
-        os.makedirs(dest, exist_ok=True)
-        dest_wsl = _wsl_parts(dest) if sys.platform == "win32" else None
-        copied = False
-        if dest_wsl is not None:
-            # Windows writes into a \\wsl.localhost share run at ~6 MB/s; a
-            # copy run inside WSL from /mnt/c measured ~150 MB/s (25x). Stage
-            # the weights on local disk next to the LoRA, then copy from WSL.
-            stage = os.path.join(os.path.dirname(os.path.abspath(lora_path)), "_export_staging", name)
-            os.makedirs(stage, exist_ok=True)
-            staged = os.path.join(stage, "model.safetensors")
-            save_file(state, staged, metadata={"format": "pt"})
-            del state
-            distro, dest_linux = dest_wsl
-            src_linux = _to_linux_path(staged, distro)
-            if src_linux:
-                r = subprocess.run(["wsl.exe", "-d", distro, "--", "cp", src_linux, dest_linux + "/model.safetensors"],
-                                   capture_output=True)
-                copied = r.returncode == 0
-            if not copied:
-                shutil.copyfile(staged, os.path.join(dest, "model.safetensors"))
-            shutil.rmtree(stage, ignore_errors=True)
-            try:
-                os.rmdir(os.path.dirname(stage))  # only if no other export is staging
-            except OSError:
-                pass
-        else:
-            save_file(state, os.path.join(dest, "model.safetensors"), metadata={"format": "pt"})
-            del state
-        written = ["model.safetensors"]
-        for entry in sorted(os.listdir(self.base_path)):
-            src = os.path.join(self.base_path, entry)
-            if os.path.isfile(src) and entry not in _SKIP_FILES and not entry.startswith("."):
-                shutil.copy2(src, os.path.join(dest, entry))
-                written.append(entry)
-        linked = {}
-        for d in _LINK_DIRS:
-            src = os.path.join(self.base_path, d)
-            if os.path.isdir(src):
-                linked[d] = self._link_dir(src, os.path.join(dest, d))
-        with open(os.path.join(dest, EXPORT_MARKER), "w", encoding="utf-8") as f:
-            json.dump({"source_lora": os.path.abspath(lora_path), "files": written, "dirs": linked}, f, indent=2)
-        print_acc(f"omnivoice: exported merged model to {dest} ({time.time() - t0:.0f}s)")
-        if self.export_keep > 0:
-            self._prune_exports(name)
-
-    def _link_dir(self, src: str, dst: str) -> str:
-        """Link the big shared folders (the 769 MB audio tokenizer) instead of
-        copying them. Returns how: 'wsl-symlink', 'symlink', 'junction' or 'copy'."""
-        if os.path.lexists(dst):
-            return "existing"
-        dst_wsl = _wsl_parts(dst)
-        if dst_wsl is not None and sys.platform == "win32":
-            distro, dst_linux = dst_wsl
-            src_linux = _to_linux_path(src, distro)
-            if src_linux:
-                r = subprocess.run(["wsl.exe", "-d", distro, "--", "ln", "-s", src_linux, dst_linux],
-                                   capture_output=True)
-                if r.returncode == 0:
-                    return "wsl-symlink"
-        try:
-            os.symlink(src, dst, target_is_directory=True)
-            return "symlink"
-        except OSError:
-            pass
-        if sys.platform == "win32" and dst_wsl is None and _wsl_parts(src) is None:
-            r = subprocess.run(["cmd", "/c", "mklink", "/J", dst, src], capture_output=True)
-            if r.returncode == 0:
-                return "junction"
-        shutil.copytree(src, dst)
-        return "copy"
-
-    def _prune_exports(self, current: str):
-        """Keep the newest comfyui_export_keep exports of this job. Only removes
-        what an export wrote (per its marker); links are unlinked, never followed."""
-        job_prefix = re.sub(r"_\d+$", "", current)
-        exports = []
-        for d in glob.glob(os.path.join(self.export_dir, "*", EXPORT_MARKER)):
-            folder = os.path.dirname(d)
-            base = os.path.basename(folder)
-            if re.sub(r"_\d+$", "", base) == job_prefix:
-                exports.append((os.path.getmtime(d), folder))
-        exports.sort(reverse=True)
-        for _, folder in exports[self.export_keep:]:
-            try:
-                with open(os.path.join(folder, EXPORT_MARKER), encoding="utf-8") as f:
-                    marker = json.load(f)
-                for fname in marker.get("files", []):
-                    p = os.path.join(folder, fname)
-                    if os.path.isfile(p):
-                        os.remove(p)
-                for dname, how in marker.get("dirs", {}).items():
-                    p = os.path.join(folder, dname)
-                    if how == "wsl-symlink":
-                        distro, linux = _wsl_parts(p)
-                        subprocess.run(["wsl.exe", "-d", distro, "--", "rm", "--", linux], capture_output=True)
-                    elif how in ("symlink", "junction"):
-                        os.unlink(p) if how == "symlink" else os.rmdir(p)
-                    elif how == "copy":
-                        shutil.rmtree(p)
-                os.remove(os.path.join(folder, EXPORT_MARKER))
-                os.rmdir(folder)
-                print_acc(f"omnivoice: removed old export {os.path.basename(folder)}")
-            except Exception as e:
-                print_acc(f"omnivoice: could not remove old export {folder}: {e}")
