@@ -19,9 +19,11 @@ from .anima import AnimaModel
 from .ideogram4 import Ideogram4Model
 from .prx_pixel_t2i import PRXPixelT2IModel
 from .krea2 import Krea2Model
+from .iris3b import Iris3BModel
 from .boogu_image import BooguImageModel, BooguImageEditModel
 from .mageflow import MageFlowModel, MageFlowEditModel
 from .minimax_h3 import MinimaxH3Model, MinimaxH3Ref2VAModel, MinimaxH3FastModel
+from .flux3 import Flux3Model
 
 AI_TOOLKIT_MODELS = [
     # put a list of models here
@@ -56,6 +58,7 @@ AI_TOOLKIT_MODELS = [
     Ideogram4Model,
     PRXPixelT2IModel,
     Krea2Model,
+    Iris3BModel,
     BooguImageModel,
     BooguImageEditModel,
     MageFlowModel,
@@ -63,4 +66,5 @@ AI_TOOLKIT_MODELS = [
     MinimaxH3Model,
     MinimaxH3Ref2VAModel,
     MinimaxH3FastModel,
+    Flux3Model,
 ]
