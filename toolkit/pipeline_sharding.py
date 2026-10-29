@@ -40,6 +40,31 @@ def _move_to_device(obj, device: torch.device):
     return obj
 
 
+def resolve_pipeline_devices(
+    train_device, pipeline_devices: Optional[List[str]] = None, status_fn=print_acc
+) -> List[str]:
+    # the primary (first) device holds the non-block modules and must be the
+    # trainer's device: the model's output lands there and the loss math runs
+    # against tensors on it. Defaults to every visible cuda device.
+    _train_dev = torch.device(train_device)
+    _train_idx = _train_dev.index if _train_dev.index is not None else 0
+    primary = f"cuda:{_train_idx}"
+    if pipeline_devices is None:
+        return [primary] + [
+            f"cuda:{i}" for i in range(torch.cuda.device_count()) if i != _train_idx
+        ]
+    devices = [str(torch.device(d)) for d in pipeline_devices]
+    if devices[0] != primary:
+        if primary in devices:
+            devices.remove(primary)
+        devices.insert(0, primary)
+        status_fn(
+            f"pipeline_devices reordered to {devices}: the trainer device "
+            f"({primary}) must be the primary shard device"
+        )
+    return devices
+
+
 class PipelineShardManager:
     """Splits a transformer's repeated blocks across multiple gpus so models
     larger than one gpu's vram can train without cpu offloading.
