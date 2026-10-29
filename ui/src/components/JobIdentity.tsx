@@ -39,6 +39,7 @@ interface SlotScore {
   extra?: { yaw?: number; view?: string; det_score?: number } | null;
   features?: Record<string, { raw: number | null; score: number | null }>;
   delta?: number | null;
+  confidence?: 'HIGH' | 'MEDIUM' | 'LOW' | null;
 }
 
 interface IdentityData {
@@ -147,7 +148,7 @@ export default function JobIdentity({ job }: { job: Job }) {
       {stubRoles.length > 0 && (
         <p className="text-sm text-yellow-500">
           Placeholder scorer for {stubRoles.join(' and ')}: those numbers exercise the pipeline and do not measure
-          identity yet{stubRoles.length === 1 && stubRoles[0] === 'body' ? ' (body scoring arrives in Phase 2)' : ''}.
+          identity (identity_eval backend is set to stub).
         </p>
       )}
       <div className="flex flex-wrap gap-4">
@@ -247,7 +248,7 @@ export default function JobIdentity({ job }: { job: Job }) {
                           <span className="text-gray-500">
                             {' ('}
                             {Object.entries(r.features)
-                              .map(([k, v]) => `${k.replace(/^face_/, '')} ${fmt(v.score)}`)
+                              .map(([k, v]) => `${k.replace(/^(face|body)_/, '')} ${fmt(v.score)}`)
                               .join(', ')}
                             {')'}
                           </span>
@@ -256,6 +257,12 @@ export default function JobIdentity({ job }: { job: Job }) {
                           <span className="text-gray-500">
                             {' '}
                             · seen as {r.extra.view} ({Math.round(r.extra.yaw ?? 0)}°)
+                          </span>
+                        )}
+                        {r.confidence && (
+                          <span className={r.confidence === 'LOW' ? 'text-yellow-500' : 'text-gray-500'}>
+                            {' '}
+                            · {r.confidence.toLowerCase()} confidence
                           </span>
                         )}
                         {r.baseline === 'pooled' && <span className="text-yellow-500"> · median baseline</span>}

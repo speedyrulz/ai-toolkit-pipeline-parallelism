@@ -29,10 +29,12 @@ from proc import serve  # noqa: E402
 
 
 def build_backend(role: str, device: str, backend: str, models: dict):
-    # face v1 is real; body stays on the stub until P2
     if backend == "auto" and role == "face":
         from face import FaceBackend
         return FaceBackend(role, device, models)
+    if backend == "auto" and role == "body":
+        from body import BodyBackend
+        return BodyBackend(role, device, models)
     from stub import StubBackend
     return StubBackend(role, device)
 

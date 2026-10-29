@@ -204,8 +204,44 @@ v1 body score is `metric_version 1.0.0-body-v1` with the 40/30/30 weights.
 **Estimator agreement** (MHR vs SMPL-X shape, after conversion) feeds the
 LOW/MEDIUM/HIGH confidence tag, not the score.
 
-Rendering silhouettes uses a CPU triangle rasterizer (projected faces via
-OpenCV `fillPoly`) to avoid a PyTorch3D build on the RTX 5060 Ti (sm_120).
+As built (`toolkit/identity_eval/worker/body.py`, `1.0.0-body-v1`):
+
+- **Code and weights**: `sam-3d-body`, `dinov3` and `SMPLest-X` are fetched at
+  pinned commits into `~/.cache/identity_eval/repos`. Weights come from
+  Hugging Face (`facebook/sam-3d-body-dinov3`, gated; `waanqii/SMPLest-X`) and
+  load with `torch.load(weights_only=True)`. The DINOv3 backbone is built from
+  the pinned checkout instead of `torch.hub` (which would fetch the latest code).
+  SAM 3D Body uses the TorchScript MHR in its checkpoint (no pymomentum);
+  detectron2, ultralytics and chumpy are not needed. Needs a CUDA GPU.
+- **SMPL-X files**: `<smplx_model_dir>/smplx/SMPLX_{NEUTRAL,MALE,FEMALE}.npz`,
+  the MANO/FLAME correspondences and `smplx_parts_segm.pkl` (loaded with a
+  numpy-only unpickler). VPoser is not used.
+- **Subject and QC**: torchvision Mask R-CNN person box; `NO_BODY` when none,
+  when another person (not inside the main box) has ≥ 50% of its area, or when
+  the person is under 256 px tall; `BODY_CROPPED` when an ankle falls more than
+  5% below the frame.
+- **Reference body**: per-component median of the reference estimates (MHR
+  shape + scale; SMPL-X betas). The multi-view SMPLify-X fit is not built.
+- **Features** (head excluded throughout; shapes scale-normalized, so they
+  measure build rather than estimated height):
+
+  | Feature | Weight |
+  |---------|--------|
+  | `body_shape_mhr`: pose-neutral MHR mesh distance | 30% |
+  | `body_shape_smplx`: T-pose SMPL-X mesh distance | 30% |
+  | `body_proportions`: 10 SMPL-X measurements (shoulder width, torso, thigh, shin, upper arm, forearm, chest/waist/hip/thigh girth) over neck-to-ankle height | 40% |
+
+  The reprojected silhouette was built and dropped: on the reference set it
+  scored random bodies the same as the reference body (0.75 vs 0.755), while
+  the other three separated every random body.
+- **Estimator agreement**: the gap between the two calibrated shape scores
+  gives HIGH (< 15), MEDIUM (< 30) or LOW per slot; LOW slots raise a round
+  warning. It does not change the score.
+- **View**: body facing angle from the 3D shoulders and hips (front < 30°,
+  three_quarter < 65°, side < 115°, else back). Slots whose suite bin is `any`
+  are aggregated by the view seen (face slots too).
+- Timing on the 5060 Ti: ~42 s model load, ~2 s to move to the GPU, ~12 s for
+  a 6-face + 6-body + 4-flex round with both workers on one GPU.
 
 ## Calibration and fusion
 
@@ -269,15 +305,23 @@ identity_eval:
 
 P0 is implemented and has run on a real training job.
 
-P1 is implemented: face v1 (`1.0.0-face-v1`) and the flex guard run in the
-face worker. Body still uses the placeholder scorer (`0.0.0-stub`) until P2.
+P1 is implemented and has run on a real training job: face v1
+(`1.0.1-face-v1`) and the flex guard run in the face worker.
+
+P2 is implemented: body v1 (`1.0.0-body-v1`, see Body). Verified end to end
+with the real models (body scores rise as a widened body converges to the
+reference build). Only 6 of the 22 current body references are usable (the
+rest crop the feet or show several people). Still to do: review
+front/side/back comparisons on a real run (P2 exit criterion).
+
 `backend: stub` in `identity_eval` forces the placeholder for both workers.
 Evaluator dependencies beyond the toolkit's are listed in
 `toolkit/identity_eval/requirements.txt`. Verified end to end with the real
 models on photos and synthetic rounds; still to do: review cross-pose cases on
 a real training run (P1 exit criterion).
 
-Still open from P0: the SAM 3D Body / SMPLest-X install spike (P2).
+The P0 install spike is done: SAM 3D Body and SMPLest-X run on Windows
+native with torch 2.13 + CUDA 13 on the RTX 5060 Ti.
 
 ## Phases
 

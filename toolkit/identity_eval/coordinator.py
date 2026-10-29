@@ -80,6 +80,12 @@ class IdentityEval:
     def uses_gpu(self) -> bool:
         return any(g is not None and g >= 0 for g in self.gpus.values())
 
+    def _worker_models(self, role: str) -> dict:
+        models = dict(self.cfg.models)
+        if role == "body" and self.cfg.smplx_model_dir:
+            models.setdefault("smplx_model_dir", self.cfg.smplx_model_dir)
+        return models
+
     def _start_workers(self):
         python = self.cfg.evaluator_python or sys.executable
         for role in ROLES:
@@ -90,11 +96,11 @@ class IdentityEval:
             w = JsonProcess(
                 f"identity {role} worker",
                 [python, "-u", WORKER_MAIN, "--role", role, "--device", device,
-                 "--backend", self.cfg.backend, "--models", json.dumps(self.cfg.models)],
+                 "--backend", self.cfg.backend, "--models", json.dumps(self._worker_models(role))],
                 os.path.join(self.root, f"worker_{role}.log"),
                 env=gpu_env(gpu),
             )
-            # the face worker loads its models before it answers (first run downloads them)
+            # workers load their models before they answer (the first run downloads them)
             w.start()
             info = w.request("info", timeout=60)
             self.workers[role] = w
@@ -378,8 +384,10 @@ class IdentityEval:
             role = s["modality"]
             weights = self.weights[role]
             r = raw.get(s["id"], {"status": S.FAILED, "reason": "image missing", "raws": {}})
-            entry = {"modality": role, "bin": s["bin"], "status": r["status"], "reason": r.get("reason"),
-                     "score": None, "extra": r.get("extra")}
+            # slots without a declared view are binned by the view the worker saw
+            seen = (r.get("extra") or {}).get("view")
+            entry = {"modality": role, "bin": seen if s["bin"] == "any" and seen else s["bin"],
+                     "status": r["status"], "reason": r.get("reason"), "score": None, "extra": r.get("extra")}
             if r["status"] == S.VALID:
                 base = a["baselines"].get(s["id"])
                 if base is None:
@@ -395,10 +403,12 @@ class IdentityEval:
                 else:
                     res = S.score_slot(r["raws"], base, a["targets"], weights)
                     entry.update(res)
+                    if role == "body":
+                        entry["confidence"] = self._agreement(res["features"])
                     if res["max_ratio"] is not None and res["max_ratio"] > 1.0:
                         over_target += 1
             per_image[s["id"]] = entry
-            by_modality[role].append({"bin": s["bin"], "score": entry["score"]})
+            by_modality[role].append({"bin": entry["bin"], "score": entry["score"]})
 
         flex = self._flex(raw, per_image)
         agg = {r: S.aggregate(by_modality[r], len(by_modality[r])) for r in ROLES}
@@ -406,6 +416,9 @@ class IdentityEval:
         warnings = []
         if over_target:
             warnings.append(f"{over_target} slot(s) past the reference target: possible memorization")
+        low = [k for k, v in per_image.items() if v.get("confidence") == "LOW"]
+        if low:
+            warnings.append(f"body estimators disagree on {len(low)} slot(s) (low confidence): {', '.join(low)}")
         pooled_slots = [k for k, v in per_image.items() if v.get("baseline") == "pooled"]
         if pooled_slots:
             warnings.append(f"{len(pooled_slots)} slot(s) use the suite's median step-0 baseline "
@@ -452,6 +465,17 @@ class IdentityEval:
         if flex["delta"] is not None:
             metrics["identity/flex"] = flex["delta"]
         return {"step": step, "metrics": metrics}
+
+    @staticmethod
+    def _agreement(features: dict) -> Optional[str]:
+        """Confidence tag from how closely the two body estimators' calibrated
+        shape scores agree (MHR via SAM 3D Body, SMPL-X via SMPLest-X)."""
+        a = (features.get("body_shape_mhr") or {}).get("score")
+        b = (features.get("body_shape_smplx") or {}).get("score")
+        if a is None or b is None:
+            return None
+        d = abs(a - b)
+        return "HIGH" if d < 15 else "MEDIUM" if d < 30 else "LOW"
 
     def _pooled_baseline(self, role: str) -> Dict[str, float]:
         """Per-feature median of the paired baselines of one suite."""
