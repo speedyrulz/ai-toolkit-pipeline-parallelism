@@ -1664,6 +1664,7 @@ export default function SimpleJob({
                       options={[
                         { value: 'flowmatch', label: 'FlowMatch' },
                         { value: 'ddpm', label: 'DDPM' },
+                        { value: 'lcm', label: 'LCM' },
                       ]}
                     />
                     <NumberInput
