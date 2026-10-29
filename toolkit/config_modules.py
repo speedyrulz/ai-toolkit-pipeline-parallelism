@@ -164,6 +164,11 @@ class SampleConfig:
         self.do_cfg_norm: bool = kwargs.get('do_cfg_norm', False)
         # character likeness scoring of each sample round
         self.likeness = LikenessConfig(**(kwargs.get('likeness') or {}))
+        # extra LoRAs applied only while sampling, as forward-hook sidechains on
+        # top of the network being trained: [{path, strength, name?}]
+        self.loras: List[dict] = [
+            l for l in (kwargs.get('loras') or []) if isinstance(l, dict) and l.get('path')
+        ]
 
     @property
     def prompts(self):

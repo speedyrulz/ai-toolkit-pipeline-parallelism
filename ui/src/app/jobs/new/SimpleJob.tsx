@@ -1,9 +1,9 @@
 'use client';
-import { useMemo } from 'react';
+import { useMemo, useState } from 'react';
 import { ModelArch, quantizationOptions, defaultQtype, jobTypeOptions, SampleTags } from './options';
 import { useModelArchs } from '@/extensions/modelArchs';
 import { defaultCompileOptions, defaultDatasetConfig } from './jobConfig';
-import { GroupedSelectOption, JobConfig, SelectOption } from '@/types';
+import { GroupedSelectOption, JobConfig, SampleLora, SelectOption } from '@/types';
 import { objectCopy, tagsToObj, objToTags } from '@/utils/basic';
 import {
   TextInput,
@@ -16,7 +16,8 @@ import {
   CreatableSelectInput,
 } from '@/components/formInputs';
 import Card from '@/components/Card';
-import { X, Copy, Wand2, SquareDashed, Info } from 'lucide-react';
+import { X, Copy, Wand2, SquareDashed, Info, Plus } from 'lucide-react';
+import LoraBrowserModal, { LoraPick } from '@/components/generate/LoraBrowserModal';
 import { openDoc } from '@/components/DocModal';
 import { openUpsamplePromptsModal, toAspectRatio } from '@/components/UpsamplePromptsModal';
 import { openPromptBoxEditor } from '@/components/PromptBoxEditorModal';
@@ -197,6 +198,14 @@ export default function SimpleJob({
   }, [modelArch]);
 
   const showGPUSelect = !isMac();
+
+  const [sampleLoraModalOpen, setSampleLoraModalOpen] = useState(false);
+  const sampleLoras: SampleLora[] = jobConfig.config.process[0].sample.loras || [];
+  const setSampleLoras = (next: SampleLora[]) => setJobConfig(next, 'config.process[0].sample.loras');
+  const addSampleLora = (pick: LoraPick) => {
+    if (sampleLoras.some(l => l.path === pick.path)) return;
+    setSampleLoras([...sampleLoras, { path: pick.path, name: pick.name, strength: 1.0 }]);
+  };
 
   const validationConfig = jobConfig.config.process[0].train.validation_config;
 
@@ -1800,6 +1809,61 @@ export default function SimpleJob({
                 </FormGroup>
               </div>
             </div>
+            {!isLlmModel && (
+              <div className="pt-4">
+                <label className="block text-xs text-gray-300 mb-1">Sample LoRAs</label>
+                <div className="space-y-2">
+                  {sampleLoras.map((l, i) => (
+                    <div
+                      key={l.path}
+                      className="flex items-center gap-2 bg-gray-950/60 border border-gray-800 rounded-md px-2 py-1.5"
+                    >
+                      <span className="text-xs truncate flex-1 text-gray-200" title={l.path}>
+                        {l.name}
+                      </span>
+                      <span className="text-xs text-gray-400">Strength</span>
+                      <input
+                        type="number"
+                        step={0.05}
+                        min={-2}
+                        max={3}
+                        value={l.strength}
+                        onChange={e => {
+                          const v = parseFloat(e.target.value);
+                          const next = [...sampleLoras];
+                          next[i] = { ...l, strength: isNaN(v) ? 0 : v };
+                          setSampleLoras(next);
+                        }}
+                        className="w-20 text-xs px-1.5 py-0.5 bg-gray-950 border border-gray-700 rounded text-gray-100 text-right"
+                      />
+                      <button
+                        type="button"
+                        onClick={() => setSampleLoras(sampleLoras.filter(x => x.path !== l.path))}
+                        className="text-gray-500 hover:text-red-400"
+                        title="Remove"
+                      >
+                        <X className="w-3.5 h-3.5" />
+                      </button>
+                    </div>
+                  ))}
+                  <button
+                    type="button"
+                    onClick={() => setSampleLoraModalOpen(true)}
+                    className="px-3 py-1 rounded-md bg-gray-800 hover:bg-gray-700 text-gray-200 text-xs inline-flex items-center gap-1"
+                  >
+                    <Plus className="w-3.5 h-3.5" /> Add LoRA
+                  </button>
+                </div>
+                <div className="text-[11px] text-gray-500 mt-1">
+                  Applied on top of the LoRA being trained, only while generating samples. Never trained or merged.
+                </div>
+                <LoraBrowserModal
+                  isOpen={sampleLoraModalOpen}
+                  onClose={() => setSampleLoraModalOpen(false)}
+                  onPick={addSampleLora}
+                />
+              </div>
+            )}
             <div className="pt-2 mb-2 flex items-center justify-between">
               <label className="block text-xs text-gray-300">
                 Sample Prompts ({jobConfig.config.process[0].sample.samples.length})

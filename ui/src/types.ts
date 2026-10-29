@@ -268,6 +268,14 @@ export interface SampleConfig {
   fps: number;
   duration?: number;
   likeness?: LikenessConfig;
+  // extra LoRAs applied only while sampling, on top of the network being trained
+  loras?: SampleLora[];
+}
+
+export interface SampleLora {
+  path: string;
+  name: string;
+  strength: number;
 }
 
 export interface LikenessConfig {
