@@ -6,14 +6,16 @@ truncation check -> two independent body estimates:
   SMPLest-X   (SMPL-X betas, pose, camera)
 The reference body is the per-component median of the reference estimates in
 each space (the leave-one-out target uses the same rule without the evaluated
-reference). The head is excluded from every measurement.
+reference). Only the shoulders-to-knees region is measured (torso, hips,
+thighs, upper arms and forearms), so images only need that much in frame:
+the head, hands, shins and feet are never compared.
 
 Features, each calibrated on its own:
   body_shape_mhr    0.30  pose-neutral MHR mesh vs the reference MHR mesh
   body_shape_smplx  0.30  T-pose SMPL-X mesh vs the reference SMPL-X mesh
                           (the two are never compared with each other)
   body_proportions  0.40  SMPL-X anthropometrics (widths, lengths, girths) as
-                          ratios to the neck-to-ankle height
+                          ratios to the neck-to-knee height
 The plan's reprojected-silhouette feature was dropped: on the reference set it
 did not separate the reference body from random bodies.
 Shape raw values are scale-normalized (estimated absolute height is camera
@@ -58,11 +60,13 @@ FEATURE_WEIGHTS = {"body_shape_mhr": 0.3, "body_shape_smplx": 0.3, "body_proport
 PERSON_SCORE = 0.7
 AMBIGUOUS_RATIO = 0.5     # a second person this large (area) makes the subject ambiguous
 MIN_PERSON_PX = 256       # person box height
-ANKLE_MARGIN = 1.05       # ankles may sit this far below the frame (feet cropped, legs whole)
+KNEE_MARGIN = 0.98        # knees must sit above this fraction of the frame height
 CONTAINED = 0.6           # a detection this much inside the main box is part of the same person
-HEAD_LABELS = (15, 22, 23, 24)   # SMPL-X head, jaw, eyes (smplx_parts_segm face labels)
-KP = {"l_ear": 3, "r_ear": 4, "l_shoulder": 5, "r_shoulder": 6, "l_hip": 9, "r_hip": 10,
-      "l_ankle": 13, "r_ankle": 14}  # SAM 3D Body mhr70 keypoints
+# SMPL-X parts measured (smplx_parts_segm labels = skinning joints): pelvis,
+# thighs, spine, collars, upper arms, forearms
+BODY_LABELS = (0, 1, 2, 3, 6, 9, 13, 14, 16, 17, 18, 19)
+KP = {"l_shoulder": 5, "r_shoulder": 6, "l_elbow": 7, "r_elbow": 8, "l_hip": 9, "r_hip": 10,
+      "l_knee": 11, "r_knee": 12}  # SAM 3D Body mhr70 keypoints
 
 
 # ----------------------------------------------------------------------
@@ -203,7 +207,7 @@ class Sam3dBody:
         self.transform = Compose([GetBBoxCenterScale(), TopdownAffine(input_size=cfg.MODEL.IMAGE_SIZE, use_udp=False),
                                   VisionTransformWrapper(ToTensor())])
         self.faces = self.model.head_pose.faces.cpu().numpy()
-        self.head_idx = self._head_vertices()
+        self.body_idx = self._body_vertices()
 
     @staticmethod
     @contextlib.contextmanager
@@ -251,12 +255,16 @@ class Sam3dBody:
             return out[0][0].cpu().numpy(), out[1][0, :70].cpu().numpy()
         return out[0].cpu().numpy()
 
-    def _head_vertices(self) -> np.ndarray:
-        """Vertices above the chin line of the zero-shape MHR body (topology fixed)."""
+    def _body_vertices(self) -> np.ndarray:
+        """Shoulders-to-knees vertices of the zero-shape MHR body (topology fixed):
+        between knee and shoulder height, arms cut past the elbows."""
         v, kp = self._mhr(np.zeros(45), np.zeros(28), keypoints=True)
         shoulder = (kp[KP["l_shoulder"], 1] + kp[KP["r_shoulder"], 1]) / 2
-        ear = (kp[KP["l_ear"], 1] + kp[KP["r_ear"], 1]) / 2
-        return np.where(v[:, 1] > shoulder + 0.45 * (ear - shoulder))[0]
+        knee = (kp[KP["l_knee"], 1] + kp[KP["r_knee"], 1]) / 2
+        center = (kp[KP["l_hip"], 0] + kp[KP["r_hip"], 0]) / 2
+        reach = max(abs(kp[KP["l_elbow"], 0] - center), abs(kp[KP["r_elbow"], 0] - center))
+        keep = (v[:, 1] >= knee) & (v[:, 1] <= shoulder) & (np.abs(v[:, 0] - center) <= reach)
+        return np.where(keep)[0]
 
     def neutral(self, shape, scale) -> np.ndarray:
         return self._mhr(shape, scale)
@@ -375,7 +383,7 @@ class SmplxBody:
         vlabel = np.full(self.layer.get_num_verts(), -1)
         vlabel[self.faces.reshape(-1)] = np.repeat(segm, 3)
         self.vlabel = vlabel
-        self.body_idx = np.where(~np.isin(vlabel, HEAD_LABELS))[0]
+        self.body_idx = np.where(np.isin(vlabel, BODY_LABELS))[0]
 
     def mesh(self, betas):
         torch = self.torch
@@ -394,13 +402,12 @@ class SmplxBody:
     def proportions(self, betas) -> np.ndarray:
         v, j = self.mesh(betas)
         d = lambda a, b: float(np.linalg.norm(j[a] - j[b]))
-        stature = j[12, 1] - (j[7, 1] + j[8, 1]) / 2   # neck to ankles
+        stature = j[12, 1] - (j[4, 1] + j[5, 1]) / 2   # neck to knees
         torso = (0, 3, 6, 9)
         m = [
             d(16, 17),                                    # shoulder width
             d(0, 12),                                     # torso length
             (d(1, 4) + d(2, 5)) / 2,                      # thigh length
-            (d(4, 7) + d(5, 8)) / 2,                      # shin length
             (d(16, 18) + d(17, 19)) / 2,                  # upper arm
             (d(18, 20) + d(19, 21)) / 2,                  # forearm
             self._girth(v, j[9, 1], torso),               # chest
@@ -422,7 +429,7 @@ def proportions_raw(p: np.ndarray, ref: np.ndarray) -> float:
 # ----------------------------------------------------------------------
 class BodyBackend:
     name = "body-v1"
-    metric_version = "1.0.0-body-v1"
+    metric_version = "1.1.0-body-v1"
     features = list(FEATURE_WEIGHTS)
     weights = dict(FEATURE_WEIGHTS)
 
@@ -484,9 +491,13 @@ class BodyBackend:
         if box[3] - box[1] < MIN_PERSON_PX:
             return {"status": "NO_BODY", "reason": f"person too small ({int(box[3] - box[1])}px tall)"}
         sam = self.sam.estimate(rgb, box)
-        ankles = sam["kp2d"][[KP["l_ankle"], KP["r_ankle"]]]
-        if (ankles[:, 1] > h * ANKLE_MARGIN).any():
-            return {"status": "BODY_CROPPED", "reason": "feet out of frame"}
+        kp = sam["kp2d"]
+        knees = kp[[KP["l_knee"], KP["r_knee"]]]
+        shoulders = kp[[KP["l_shoulder"], KP["r_shoulder"]]]
+        if (knees[:, 1] > h * KNEE_MARGIN).any():
+            return {"status": "BODY_CROPPED", "reason": "knees out of frame"}
+        if (shoulders[:, 1] < 0).any():
+            return {"status": "BODY_CROPPED", "reason": "shoulders out of frame"}
         smx = self.smplestx.estimate(rgb, box)
         yaw = body_yaw(sam["kp3d"])
         return {"status": "VALID", "sam": sam, "betas": smx["betas"],
@@ -505,7 +516,7 @@ class BodyBackend:
         return {"shape": shape, "scale": scale, "mhr": mhr, "smplx": sx, "props": self.smplx.proportions(betas)}
 
     def _raws(self, a: dict, canon: dict) -> Dict[str, float]:
-        body = np.setdiff1d(np.arange(len(canon["mhr"])), self.sam.head_idx)
+        body = self.sam.body_idx
         own_mhr = self.sam.neutral(a["sam"]["shape"], a["sam"]["scale"])
         own_sx, _ = self.smplx.mesh(a["betas"])
         return {
