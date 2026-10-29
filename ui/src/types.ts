@@ -270,7 +270,6 @@ export interface SampleConfig {
   num_frames: number;
   fps: number;
   duration?: number;
-  likeness?: LikenessConfig;
   // extra LoRAs applied only while sampling, on top of the network being trained
   loras?: SampleLora[];
 }
@@ -279,26 +278,6 @@ export interface SampleLora {
   path: string;
   name: string;
   strength: number;
-}
-
-export interface LikenessConfig {
-  enabled: boolean;
-  reference_folder: string;
-  comfyui_path: string;
-  python?: string;
-  device?: 'cpu' | 'gpu';
-  gpu_index?: number;
-  cpu_threads?: number;
-  sam3d_model?: string;
-  clip_vision_model?: string;
-  face_library?: string;
-  proportion_tolerance?: number;
-  build_tolerance?: number;
-  proportion_weight?: number;
-  weights?: number[];
-  samples?: (string | { prompt: string; [key: string]: any })[];
-  seed?: number;
-  wait_at_end_minutes?: number;
 }
 
 export interface LoggingConfig {
