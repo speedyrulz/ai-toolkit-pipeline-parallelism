@@ -48,6 +48,7 @@ ARCFACE_TEMPLATE = np.array([
 
 DET_SIZE = 640
 DET_THRESHOLD = 0.5
+PAD_RATIO = 1 / 3         # border for the second detection pass
 NMS_THRESHOLD = 0.4
 MIN_FACE_PX = 48          # shorter bbox side; smaller faces are NO_FACE
 AMBIGUOUS_RATIO = 0.6     # a second face this large (area) makes the subject ambiguous
@@ -174,6 +175,19 @@ class Scrfd:
         scores = np.concatenate(all_scores)
         kps = np.concatenate(all_kps) / scale
         return [(boxes[i], float(scores[i]), kps[i]) for i in _nms(boxes, scores, NMS_THRESHOLD)]
+
+    def detect_padded(self, img: np.ndarray):
+        """detect(), retried on a black border of PAD_RATIO per side when it
+        finds nothing: SCRFD misses close-ups whose face fills the frame and
+        runs off the edge, which the border brings back into its anchor range."""
+        faces = self.detect(img)
+        if faces:
+            return faces
+        h, w = img.shape[:2]
+        py, px = int(h * PAD_RATIO), int(w * PAD_RATIO)
+        padded = cv2.copyMakeBorder(img, py, py, px, px, cv2.BORDER_CONSTANT, value=0)
+        off = np.array([px, py], dtype=np.float32)
+        return [(box - np.tile(off, 2), score, kps - off) for box, score, kps in self.detect(padded)]
 
 
 def select_subject(faces) -> tuple:
@@ -343,7 +357,7 @@ def hf_snapshot(repo: str, patterns=None) -> str:
 # ----------------------------------------------------------------------
 class FaceBackend:
     name = "face-v1"
-    metric_version = "1.0.0-face-v1"
+    metric_version = "1.0.1-face-v1"
     features = list(FEATURE_WEIGHTS)
     weights = dict(FEATURE_WEIGHTS)
 
@@ -398,7 +412,7 @@ class FaceBackend:
     # -- face features ----------------------------------------------------
     def _face(self, path: str) -> dict:
         img = read_bgr(path)
-        face, reason = select_subject(self.det.detect(img))
+        face, reason = select_subject(self.det.detect_padded(img))
         if face is None:
             return {"status": "NO_FACE", "reason": reason}
         box, score, kps = face
