@@ -1,3 +1,4 @@
+import contextlib
 import copy
 import glob
 import inspect
@@ -7,6 +8,7 @@ import shutil
 from collections import OrderedDict
 import os
 import re
+import time
 import traceback
 from typing import Union, List, Optional
 
@@ -63,7 +65,7 @@ from tqdm import tqdm
 
 from toolkit.config_modules import SaveConfig, LoggingConfig, SampleConfig, NetworkConfig, TrainConfig, ModelConfig, \
     GenerateImageConfig, EmbeddingConfig, DatasetConfig, preprocess_dataset_raw_config, AdapterConfig, GuidanceConfig, validate_configs, \
-    DecoratorConfig
+    DecoratorConfig, IdentityEvalConfig
 from toolkit.logging_aitk import create_logger
 from diffusers import FluxTransformer2DModel
 from toolkit.accelerator import get_accelerator, unwrap_model
@@ -126,6 +128,18 @@ class BaseSDTrainProcess(BaseTrainProcess):
         else:
             self.has_first_sample_requested = False
             self.first_sample_config = self.sample_config
+        # character identity scoring of sample rounds (toolkit/identity_eval)
+        self.identity_eval_config = IdentityEvalConfig(**(self.get_conf('identity_eval', None) or {}))
+        if self.model_config.pipeline_sharding:
+            if self.identity_eval_config.enabled:
+                raise ValueError("identity_eval is not available with pipeline_sharding")
+            if self.sample_config.helper_gpu is not None:
+                raise ValueError("sample.helper_gpu is not available with pipeline_sharding")
+        self.identity_eval = None
+        self.sample_helper = None
+        # prompt embeddings for the identity suites, for when the text encoder
+        # is unloaded before sampling (filled by cache_identity_prompts)
+        self._identity_prompt_cache = {}
         self.logging_config = LoggingConfig(**self.get_conf('logging', {}))
         self.logger = create_logger(self.logging_config, config, self.save_root)
         self.optimizer: torch.optim.Optimizer = None
@@ -281,7 +295,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
         # override in subclass
         return generate_image_config_list
 
-    def sample(self, step=None, is_first=False):
+    def sample(self, step=None, is_first=False, final=False):
         if not self.accelerator.is_main_process:
             return
         flush()
@@ -338,7 +352,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
             if sample_item.seed is not None:
                 current_seed = sample_item.seed
 
-            gen_img_config_list.append(GenerateImageConfig(
+            item = dict(
                 prompt=prompt,  # it will autoparse the prompt
                 width=sample_item.width,
                 height=sample_item.height,
@@ -353,7 +367,6 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 adapter_conditioning_scale=sample_config.adapter_conditioning_scale,
                 refiner_start_at=sample_config.refiner_start_at,
                 extra_values=sample_config.extra_values,
-                logger=self.logger,
                 num_frames=sample_item.num_frames,
                 fps=sample_item.fps,
                 duration=sample_item.duration,
@@ -364,10 +377,17 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 ctrl_img_3=sample_item.ctrl_img_3,
                 do_cfg_norm=sample_config.do_cfg_norm,
                 **extra_args
-            ))
+            )
+            item['_cache_key'] = f"sample:{i}"
+            # odd prompts go to the sample helper's card when there is one
+            item['_renderer'] = 'helper' if i % 2 == 1 else 'main'
+            gen_img_config_list.append(item)
 
-        # post process
-        gen_img_config_list = self.post_process_generate_image_config_list(gen_img_config_list)
+        identity_round = (
+            self.identity_eval is not None
+            and not is_first
+            and self.identity_eval.is_eval_step(step, final=final)
+        )
 
         # if we have an ema, set it to validation mode
         if self.ema is not None:
@@ -376,21 +396,259 @@ class BaseSDTrainProcess(BaseTrainProcess):
         # let adapter know we are sampling
         if self.adapter is not None and isinstance(self.adapter, CustomAdapter):
             self.adapter.is_sampling = True
-        
+
         sample_loras = self._attach_sample_loras(sample_config)
         try:
             # send to be generated
-            self.sd.generate_images(gen_img_config_list, sampler=sample_config.sampler)
+            self._render_items(gen_img_config_list, sample_config)
         finally:
             for lora in sample_loras:
                 lora.detach()
+        if identity_round:
+            # after the sample LoRAs come off: the step-0 baseline never had them
+            self._render_items(self.identity_eval.round_items(step), sample_config)
 
         if self.adapter is not None and isinstance(self.adapter, CustomAdapter):
             self.adapter.is_sampling = False
 
         if self.ema is not None:
             self.ema.train()
+
+        if identity_round:
+            self.identity_eval.score_round(step, self._gpu_session)
         print_acc("") # add a line break
+
+    # ------------------------------------------------------------------
+    # Rendering split across the trainer's card and the sample helper's
+    # ------------------------------------------------------------------
+
+    def _helper_usable(self, sample_config) -> bool:
+        return (
+            self.sample_helper is not None
+            and self.sample_helper.alive
+            and self._helper_compatible(sample_config)
+        )
+
+    def _helper_compatible(self, sample_config) -> bool:
+        """Whether the sample helper can reproduce this job's sampling: it
+        loads the plain base model and applies the network as linear LoRA
+        hooks, so anything beyond that stays on the trainer's card."""
+        if self.is_fine_tuning or self.embedding is not None or self.adapter is not None:
+            return False
+        if sample_config.loras or self.model_config.refiner_name_or_path is not None:
+            return False
+        if self.network_config is not None and (
+            self.network_config.conv or self.network_config.type.lower() not in ('lora', 'lokr')
+        ):
+            return False
+        if type(self).post_process_generate_image_config_list is not BaseSDTrainProcess.post_process_generate_image_config_list:
+            return False
+        return True
+
+    def _render_items(self, items, sample_config):
+        """Generate images from GenerateImageConfig kwargs dicts. Each dict
+        carries _renderer ('main' | 'helper') and _cache_key (its prompt
+        embedding in sample_prompts_cache or the identity prompt cache)."""
+        use_helper = self._helper_usable(sample_config)
+        main_items, helper_items = [], []
+        for item in items:
+            # placeholders resolve per list, so bake the image index in now
+            item['output_path'] = item['output_path'].replace('[count]', str(len(main_items) + len(helper_items)))
+            on_helper = (
+                use_helper
+                and item['_renderer'] == 'helper'
+                and not item.get('ctrl_img') and not item.get('adapter_image_path')
+            )
+            if not on_helper and item['_renderer'] == 'helper' and item['_cache_key'].startswith('identity:') \
+                    and self.identity_eval is not None and self.identity_eval.uses_helper_renderer:
+                # the slot's baseline came from the other card; same-seed
+                # images can differ slightly between card architectures
+                print_acc(f"Identity eval warning: slot {item['_cache_key'][9:]} rendered on the trainer's gpu "
+                          "instead of the sample helper's; its score is less comparable")
+            (helper_items if on_helper else main_items).append(item)
+
+        if helper_items:
+            lora_path = None
+            if self.network is not None and any(i['network_multiplier'] != 0 for i in helper_items):
+                lora_path = os.path.join(self.sample_helper.work_dir, 'network_snapshot.safetensors')
+                prev_multiplier = self.network.multiplier
+                self.network.multiplier = 1.0
+                try:
+                    self.network.save_weights(lora_path, dtype=torch.float32)
+                finally:
+                    self.network.multiplier = prev_multiplier
+            strip = [{k: v for k, v in i.items() if not k.startswith('_')} for i in helper_items]
+            self.sample_helper.render_async(strip, lora_path, sample_config.sampler)
+
+        try:
+            if main_items:
+                configs = [
+                    GenerateImageConfig(**{k: v for k, v in i.items() if not k.startswith('_')}, logger=self.logger)
+                    for i in main_items
+                ]
+                configs = self.post_process_generate_image_config_list(configs)
+                regular_cache = self.sd.sample_prompts_cache
+                swap = regular_cache is not None and (
+                    helper_items or any(not i['_cache_key'].startswith('sample:') for i in main_items)
+                )
+                if swap:
+                    # generate_images reads cached embeddings by list index
+                    self.sd.sample_prompts_cache = [self._cached_embeds(i['_cache_key'], regular_cache) for i in main_items]
+                try:
+                    self.sd.generate_images(configs, sampler=sample_config.sampler)
+                finally:
+                    if swap:
+                        self.sd.sample_prompts_cache = regular_cache
+        finally:
+            if helper_items:
+                self.sample_helper.render_wait()
+
+    def _cached_embeds(self, key, regular_cache):
+        kind, _, ref = key.partition(':')
+        if kind == 'sample':
+            return regular_cache[int(ref)]
+        if ref not in self._identity_prompt_cache:
+            raise RuntimeError(f"no cached prompt embeddings for identity slot {ref}")
+        return self._identity_prompt_cache[ref]
+
+    def cache_identity_prompts(self):
+        """Encode the identity suite prompts while the text encoder is still
+        loaded; called by trainers that unload it after caching sample prompts."""
+        if not self.identity_eval_config.enabled:
+            return
+        from toolkit.identity_eval.suites import build_slots
+        slots = build_slots(self.identity_eval_config, self.sample_config,
+                            use_helper=self.sample_config.helper_gpu is not None)
+        for s in slots:
+            prompt = s['prompt']
+            if self.trigger_word is not None:
+                prompt = self.sd.inject_trigger_into_prompt(prompt, self.trigger_word, add_if_not_present=False)
+            self._identity_prompt_cache[s['id']] = {
+                'conditional': self.sd.encode_prompt(prompt).to('cpu'),
+                'unconditional': self.sd.encode_prompt(s['neg']).to('cpu'),
+            }
+
+    # ------------------------------------------------------------------
+    # Identity eval lifecycle (toolkit/identity_eval)
+    # ------------------------------------------------------------------
+
+    def _trainer_gpu_index(self) -> int:
+        """Physical (PCI order) index of the trainer's card."""
+        visible = os.environ.get('CUDA_VISIBLE_DEVICES')
+        local = (self.device_torch.index or 0) if self.device_torch.type == 'cuda' else 0
+        if visible:
+            ids = [v.strip() for v in visible.split(',') if v.strip()]
+            if local < len(ids) and ids[local].isdigit():
+                return int(ids[local])
+        return local
+
+    @contextlib.contextmanager
+    def _gpu_session(self):
+        """Free the cards for gpu scoring: the training model (and the sample
+        helper's) move to cpu, then come back exactly where they were. LoRA
+        parameters and optimizer state stay on the gpu."""
+        t0 = time.time()
+        if self.sample_helper is not None:
+            self.sample_helper.offload()
+        self.sd.set_device_state_preset('unload')
+        saved_state = self.sd.device_state
+        flush()
+        try:
+            yield
+        finally:
+            self.sd.restore_device_state()
+            if self.sample_helper is not None:
+                self.sample_helper.onload()
+            unet_device = next(self.sd.unet.parameters()).device
+            want = torch.device(saved_state['unet']['device'])
+            if unet_device.type != want.type or (want.index is not None and unet_device.index != want.index):
+                raise RuntimeError(
+                    f"identity eval: the training model did not return to {want} after scoring (it is on {unet_device})"
+                )
+            print_acc(f"Identity eval: gpu hand-off and reload took {time.time() - t0:.0f}s in total")
+
+    def _identity_start(self):
+        """Start the sample helper and identity eval before the first sample."""
+        if not self.accelerator.is_main_process or self.train_config.disable_sampling:
+            return
+        # second card: the sample helper renders on it, and identity eval
+        # scores body images on it, both only outside pipeline sharding
+        second_gpu = self.sample_config.helper_gpu
+        if second_gpu is not None and second_gpu == self._trainer_gpu_index():
+            print_acc(f"sample.helper_gpu {second_gpu} is the trainer's own gpu; ignoring it")
+            second_gpu = None
+        if second_gpu is not None:
+            if not self._helper_compatible(self.sample_config):
+                print_acc("This job uses features the sample helper does not reproduce "
+                          "(adapters, embeddings, refiner, sample LoRAs or conv/LoRM networks); "
+                          "sampling stays on the trainer's gpu")
+            else:
+                from toolkit.identity_eval.helper_client import SampleHelper
+                model_conf = copy.deepcopy(self.get_conf('model', {}))
+                model_conf['dtype'] = self.train_config.dtype
+                helper = SampleHelper(second_gpu, os.path.join(self.save_root, '.sample_helper'),
+                                      model_conf, self.train_config.dtype, self.train_config.noise_scheduler)
+                if helper.start():
+                    self.sample_helper = helper
+                    import atexit
+                    atexit.register(helper.close)
+
+        if not self.identity_eval_config.enabled:
+            return
+        from toolkit.identity_eval.coordinator import IdentityEval
+        from toolkit.identity_eval.manifest import fingerprint_model
+        datasets = self.get_conf('datasets', None) or []
+        default_refs = datasets[0].get('folder_path', '') if datasets else ''
+
+        def prompt_fn(prompt):
+            if self.trigger_word is not None:
+                return self.sd.inject_trigger_into_prompt(prompt, self.trigger_word, add_if_not_present=False)
+            return prompt
+
+        ie = IdentityEval(
+            self.identity_eval_config, self.sample_config, self.save_root,
+            trainer_gpu=self._trainer_gpu_index(),
+            second_gpu=second_gpu,
+            use_helper=self._helper_usable(self.sample_config),
+            default_references=default_refs,
+            model_fingerprint=fingerprint_model(self.model_config.name_or_path),
+            prompt_fn=prompt_fn,
+        )
+        import atexit
+        atexit.register(ie.close)
+        if self.ema is not None:
+            self.ema.eval()
+        try:
+            started = ie.start(lambda items: self._render_items(items, self.sample_config), self._gpu_session)
+        finally:
+            if self.ema is not None:
+                self.ema.train()
+        if started:
+            self.identity_eval = ie
+
+    def _identity_log(self, rounds):
+        for r in rounds:
+            if r['metrics']:
+                if self.writer is not None:
+                    for k, v in r['metrics'].items():
+                        self.writer.add_scalar(k, v, r['step'])
+                # scores land after their round; log them against the step
+                # they measure, at a point where nothing else is pending
+                self.logger.log(r['metrics'])
+                self.logger.commit(step=r['step'])
+
+    def _identity_poll(self):
+        if self.identity_eval is not None:
+            self._identity_log(self.identity_eval.poll())
+
+    def _identity_finish(self):
+        if self.identity_eval is not None:
+            self._identity_log(self.identity_eval.finish(self.identity_eval_config.wait_at_end_minutes * 60))
+            self.identity_eval.close()
+            self.identity_eval = None
+        if self.sample_helper is not None:
+            self.sample_helper.close()
+            self.sample_helper = None
 
     def _attach_sample_loras(self, sample_config):
         """Attach the sample config's extra LoRAs as forward-hook sidechains at
@@ -2914,6 +3172,10 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     print_acc(f"Failed to compile model: {e}")
                     print_acc("Continuing without compilation")
 
+        # sample helper on the second gpu, then identity eval calibration
+        # (step-0 baseline renders with the network off)
+        self._identity_start()
+
         if self.has_first_sample_requested and self.step_num <= 1 and not self.train_config.disable_sampling:
             print_acc("Generating first sample from first sample config")
             self.sample(0, is_first=True)
@@ -2994,6 +3256,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
             if self.train_config.do_paramiter_swapping:
                 self.optimizer.optimizer.swap_paramiters()
             self.timer.start('train_loop')
+            self._identity_poll()
             if flush_next:
                 flush()
                 flush_next = False
@@ -3289,8 +3552,9 @@ class BaseSDTrainProcess(BaseTrainProcess):
         if self.accelerator.is_main_process:
             self.save()
         if not self.train_config.disable_sampling:
-            self.sample(self.step_num)
+            self.sample(self.step_num, final=True)
             self.logger.commit(step=self.step_num)
+        self._identity_finish()
         print_acc("")
         if self.accelerator.is_main_process:
             self.logger.finish()

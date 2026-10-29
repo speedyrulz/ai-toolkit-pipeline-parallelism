@@ -1,0 +1,55 @@
+"""Identity eval scoring worker (runs in the evaluator environment).
+
+    python toolkit/identity_eval/worker/main.py --role face|body --device cpu|cuda
+
+The trainer pins the process to one card with CUDA_VISIBLE_DEVICES, so a gpu
+worker always sees it as cuda:0. The worker only extracts raw features; all
+calibration math runs trainer-side in toolkit/identity_eval/scoring.py.
+
+Commands (see toolkit/identity_eval/proc.py for the wire format):
+  prepare  {references, cache_dir}  build reference templates; returns, per
+           feature, the leave-one-out raw values that set the 100 anchor
+  score    {images: [{slot, path}]} raw features per image, or a status and
+           reason when the image is unusable
+  to_gpu / to_cpu                   move models between rounds
+"""
+
+import argparse
+import os
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.dirname(HERE))  # toolkit/identity_eval, for proc.py
+sys.path.insert(0, HERE)
+
+from proc import serve  # noqa: E402
+
+
+def build_backend(role: str, device: str):
+    # P0 ships the stub backend; P1/P2 add the real face and body pipelines
+    from stub import StubBackend
+    return StubBackend(role, device)
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--role", required=True, choices=["face", "body"])
+    parser.add_argument("--device", default="cpu", choices=["cpu", "cuda"])
+    args = parser.parse_args()
+
+    backend = build_backend(args.role, args.device)
+    print(f"identity eval worker: role={args.role} device={args.device} "
+          f"backend={backend.name} metric_version={backend.metric_version}", flush=True)
+
+    serve({
+        "info": lambda: {"backend": backend.name, "metric_version": backend.metric_version,
+                         "features": backend.features},
+        "prepare": backend.prepare,
+        "score": backend.score,
+        "to_gpu": backend.to_gpu,
+        "to_cpu": backend.to_cpu,
+    })
+
+
+if __name__ == "__main__":
+    main()

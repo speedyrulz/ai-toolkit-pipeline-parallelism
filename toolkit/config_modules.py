@@ -120,6 +120,12 @@ class SampleConfig:
         self.loras: List[dict] = [
             l for l in (kwargs.get('loras') or []) if isinstance(l, dict) and l.get('path')
         ]
+        # physical gpu index (nvidia-smi / PCI order) of a second card that
+        # renders part of every sample round through a sample helper process
+        # holding its own copy of the base model. None = off. Not available
+        # with pipeline sharding.
+        helper_gpu = kwargs.get('helper_gpu', None)
+        self.helper_gpu: Optional[int] = None if helper_gpu in (None, '', -1) else int(helper_gpu)
 
     @property
     def prompts(self):
@@ -127,6 +133,52 @@ class SampleConfig:
         return [sample.prompt for sample in self.samples if sample.prompt is not None]
   
                 
+
+
+class IdentityEvalConfig:
+    """Character identity scoring of sample rounds (toolkit/identity_eval).
+    Fixed-seed face, body and flexibility prompt suites are rendered at step 0
+    with the network off and then every eval round; a scoring worker compares
+    them with reference images and reports calibrated 0-100 face, body and
+    identity scores. See docs/identity_eval_plan.md."""
+
+    def __init__(self, **kwargs):
+        self.enabled: bool = kwargs.get('enabled', False)
+        # score every Nth sample round
+        self.eval_every: int = max(1, int(kwargs.get('eval_every', 1)))
+        # python of the evaluator environment; empty = this python
+        self.evaluator_python: str = kwargs.get('evaluator_python', '') or ''
+        # physical gpu indices for the scoring workers; -1 = cpu. None = the
+        # trainer's gpu for face and the sample helper's gpu (else the
+        # trainer's) for body. While gpu scoring runs the trainer and the
+        # sample helper move their models to cpu.
+        self.face_gpu: Optional[int] = self._gpu(kwargs.get('face_gpu', None))
+        self.body_gpu: Optional[int] = self._gpu(kwargs.get('body_gpu', None))
+        # reference image folders; empty = the first dataset folder
+        self.face_references: str = kwargs.get('face_references', '') or ''
+        self.body_references: str = kwargs.get('body_references', '') or ''
+        self.holdout_references: str = kwargs.get('holdout_references', '') or ''
+        self.smplx_model_dir: str = kwargs.get('smplx_model_dir', '') or ''
+        # prompt suites: [str | {prompt, bin?, seed?, width?, height?, neg?}];
+        # a string may be 'bin | prompt' (bins: front, three_quarter, profile,
+        # side, back, ...). Empty = the built-in defaults (identity_eval/suites.py)
+        self.face_suite: List[Union[str, dict]] = kwargs.get('face_suite', []) or []
+        self.body_suite: List[Union[str, dict]] = kwargs.get('body_suite', []) or []
+        self.flex_suite: List[Union[str, dict]] = kwargs.get('flex_suite', []) or []
+        # first seed of the suites (each slot adds its index); None = sample seed
+        self.seed: Optional[int] = kwargs.get('seed', None)
+        # cpu scoring runs beside training; how long to wait for it at the end
+        self.wait_at_end_minutes: float = float(kwargs.get('wait_at_end_minutes', 30))
+        # fusion and guardrails (spec §6, plan "Flexibility guard")
+        self.face_weight: float = float(kwargs.get('face_weight', 0.55))
+        self.body_weight: float = float(kwargs.get('body_weight', 0.45))
+        self.target_quantile: float = float(kwargs.get('target_quantile', 0.75))
+
+    @staticmethod
+    def _gpu(value) -> Optional[int]:
+        if value is None or value == '':
+            return None
+        return int(value)
 
 
 class LormModuleSettingsConfig:

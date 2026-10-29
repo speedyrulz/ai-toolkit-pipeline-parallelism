@@ -410,7 +410,8 @@ class SDTrainer(BaseSDTrainProcess):
                     self.diff_output_preservation_embeds = self.cached_dop_class_embeds
                 
                 self.cache_sample_prompts()
-                
+                self.cache_identity_prompts()
+
                 print_acc("\n***** UNLOADING TEXT ENCODER *****")
                 if self.is_caching_text_embeddings:
                     print_acc("Embeddings cached to disk. We dont need the text encoder anymore")

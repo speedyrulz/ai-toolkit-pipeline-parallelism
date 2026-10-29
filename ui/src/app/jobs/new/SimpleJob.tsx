@@ -198,6 +198,17 @@ export default function SimpleJob({
   }, [modelArch]);
 
   const showGPUSelect = !isMac();
+  // the trainer's physical gpu (first of the job's gpu ids)
+  const trainerGpu = `${gpuIDs ?? ''}`.split(',')[0];
+  const identityEval = jobConfig.config.process[0].identity_eval;
+  const scoringGpuOptions = [
+    { value: '', label: 'Automatic' },
+    { value: '-1', label: 'CPU (scores beside training)' },
+    ...gpuList.map((gpu: any) => ({ value: `${gpu.index}`, label: `GPU #${gpu.index}` })),
+  ];
+  const suiteToText = (suite?: (string | { prompt: string; [key: string]: any })[]) =>
+    (suite ?? []).map(s => (typeof s === 'string' ? s : s.bin ? `${s.bin} | ${s.prompt}` : s.prompt)).join('\n');
+  const textToSuite = (value: string) => value.split('\n').filter((line: string) => line.trim() !== '');
 
   const [sampleLoraModalOpen, setSampleLoraModalOpen] = useState(false);
   const sampleLoras: SampleLora[] = jobConfig.config.process[0].sample.loras || [];
@@ -517,7 +528,14 @@ export default function SimpleJob({
                   <Checkbox
                     label="Multi-GPU (Pipeline Sharding)"
                     checked={jobConfig.config.process[0].model.pipeline_sharding || false}
-                    onChange={value => setJobConfig(value, 'config.process[0].model.pipeline_sharding')}
+                    onChange={value => {
+                      setJobConfig(value, 'config.process[0].model.pipeline_sharding');
+                      if (value) {
+                        // neither the sample helper nor identity eval runs with sharding
+                        setJobConfig(undefined, 'config.process[0].sample.helper_gpu');
+                        setJobConfig(undefined, 'config.process[0].identity_eval');
+                      }
+                    }}
                     docKey="model.pipeline_sharding"
                   />
                   {jobConfig.config.process[0].model.pipeline_sharding &&
@@ -1723,6 +1741,22 @@ export default function SimpleJob({
                   min={0}
                   required
                 />
+                {gpuList.length > 1 && !jobConfig.config.process[0].model.pipeline_sharding && (
+                  <SelectInput
+                    label="Second GPU for Sampling"
+                    className="pt-2"
+                    value={`${jobConfig.config.process[0].sample.helper_gpu ?? ''}`}
+                    onChange={value =>
+                      setJobConfig(value === '' ? undefined : parseInt(value), 'config.process[0].sample.helper_gpu')
+                    }
+                    options={[
+                      { value: '', label: 'Off' },
+                      ...gpuList
+                        .filter((gpu: any) => `${gpu.index}` !== trainerGpu)
+                        .map((gpu: any) => ({ value: `${gpu.index}`, label: `GPU #${gpu.index}` })),
+                    ]}
+                  />
+                )}
                 {!isLlmModel && (
                   <>
                     <SelectInput
@@ -2259,6 +2293,130 @@ export default function SimpleJob({
               Add Prompt
             </button>
           </Card>
+          <div className="mt-6">
+            <Card
+              title="Identity Eval"
+              toggled={!!identityEval?.enabled}
+              onToggle={value => {
+                if (value && jobConfig.config.process[0].model.pipeline_sharding) return;
+                if (value) {
+                  setJobConfig({ ...(identityEval ?? {}), enabled: true }, 'config.process[0].identity_eval');
+                } else {
+                  setJobConfig(undefined, 'config.process[0].identity_eval');
+                }
+              }}
+            >
+              {jobConfig.config.process[0].model.pipeline_sharding && (
+                <p className="text-sm text-yellow-500 mb-2">
+                  Identity eval is not available with multi-GPU pipeline sharding. Turn sharding off to use it.
+                </p>
+              )}
+              {identityEval?.enabled && (
+                <>
+                  <p className="text-sm text-gray-400 mb-4">
+                    Renders fixed-seed face, body and flexibility prompts with the network off before training, then
+                    every eval round, and scores them against reference images: face, body and combined identity on a
+                    0-100 scale where 0 is the untrained model and 100 is how consistent the reference photos are with
+                    each other. While GPU scoring runs, the training model moves to system RAM and comes back after.
+                    Phase 0 uses a placeholder scorer, so the numbers do not measure identity yet.
+                  </p>
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                    <TextInput
+                      label="Face Reference Images Folder"
+                      value={identityEval.face_references ?? ''}
+                      onChange={value => setJobConfig(value, 'config.process[0].identity_eval.face_references')}
+                      placeholder="empty = first dataset folder"
+                    />
+                    <TextInput
+                      label="Body Reference Images Folder"
+                      value={identityEval.body_references ?? ''}
+                      onChange={value => setJobConfig(value, 'config.process[0].identity_eval.body_references')}
+                      placeholder="empty = first dataset folder"
+                    />
+                    <TextInput
+                      label="Holdout Reference Images Folder"
+                      value={identityEval.holdout_references ?? ''}
+                      onChange={value => setJobConfig(value, 'config.process[0].identity_eval.holdout_references')}
+                      placeholder="optional: photos not used for training"
+                    />
+                    <TextInput
+                      label="SMPL-X Models Folder"
+                      value={identityEval.smplx_model_dir ?? ''}
+                      onChange={value => setJobConfig(value, 'config.process[0].identity_eval.smplx_model_dir')}
+                      placeholder="eg. C:\SMPL-X"
+                    />
+                    <SelectInput
+                      label="Face Scoring Device"
+                      value={`${identityEval.face_gpu ?? ''}`}
+                      onChange={value =>
+                        setJobConfig(
+                          value === '' ? undefined : parseInt(value),
+                          'config.process[0].identity_eval.face_gpu',
+                        )
+                      }
+                      options={scoringGpuOptions}
+                    />
+                    <SelectInput
+                      label="Body Scoring Device"
+                      value={`${identityEval.body_gpu ?? ''}`}
+                      onChange={value =>
+                        setJobConfig(
+                          value === '' ? undefined : parseInt(value),
+                          'config.process[0].identity_eval.body_gpu',
+                        )
+                      }
+                      options={scoringGpuOptions}
+                    />
+                    <NumberInput
+                      label="Eval Every N Sample Rounds"
+                      value={identityEval.eval_every ?? 1}
+                      onChange={value => setJobConfig(value, 'config.process[0].identity_eval.eval_every')}
+                      min={1}
+                    />
+                    <TextInput
+                      label="Evaluator Python"
+                      value={identityEval.evaluator_python ?? ''}
+                      onChange={value => setJobConfig(value, 'config.process[0].identity_eval.evaluator_python')}
+                      placeholder="empty = the toolkit's python"
+                    />
+                  </div>
+                  <p className="text-xs text-gray-500 mt-4">
+                    Prompt suites: one prompt per line, optionally prefixed with a pose bin as{' '}
+                    <code>front | prompt</code> (bins such as front, three_quarter, profile, side, back). Leave a suite
+                    empty to use the built-in prompts. Changing suites, references or the model after the first run
+                    invalidates the calibration.
+                  </p>
+                  <div className="grid grid-cols-1 gap-4 mt-2">
+                    <TextAreaInput
+                      label="Face Suite"
+                      value={suiteToText(identityEval.face_suite)}
+                      onChange={value => setJobConfig(textToSuite(value), 'config.process[0].identity_eval.face_suite')}
+                      placeholder={
+                        'front | close-up portrait photo of [trigger], looking at the camera, plain grey background\nprofile | close-up side profile portrait photo of [trigger], plain grey background'
+                      }
+                      rows={3}
+                    />
+                    <TextAreaInput
+                      label="Body Suite"
+                      value={suiteToText(identityEval.body_suite)}
+                      onChange={value => setJobConfig(textToSuite(value), 'config.process[0].identity_eval.body_suite')}
+                      placeholder={
+                        'front | full body photo of [trigger] standing, front view, fitted clothing, plain white studio background\nback | full body photo of [trigger] standing, back view, fitted clothing, plain white studio background'
+                      }
+                      rows={3}
+                    />
+                    <TextAreaInput
+                      label="Flexibility Suite"
+                      value={suiteToText(identityEval.flex_suite)}
+                      onChange={value => setJobConfig(textToSuite(value), 'config.process[0].identity_eval.flex_suite')}
+                      placeholder={'photo of [trigger] wearing a red raincoat, walking on a city street at night'}
+                      rows={3}
+                    />
+                  </div>
+                </>
+              )}
+            </Card>
+          </div>
         </div>
 
         {status === 'success' && <p className="text-green-500 text-center">Training saved successfully!</p>}

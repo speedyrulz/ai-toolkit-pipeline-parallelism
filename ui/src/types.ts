@@ -272,6 +272,28 @@ export interface SampleConfig {
   duration?: number;
   // extra LoRAs applied only while sampling, on top of the network being trained
   loras?: SampleLora[];
+  // physical gpu index of a second card that renders part of each sample
+  // round (not with pipeline sharding)
+  helper_gpu?: number | null;
+}
+
+export interface IdentityEvalConfig {
+  enabled: boolean;
+  eval_every?: number;
+  evaluator_python?: string;
+  // physical gpu index, -1 = cpu, unset = automatic
+  face_gpu?: number | null;
+  body_gpu?: number | null;
+  face_references?: string;
+  body_references?: string;
+  holdout_references?: string;
+  smplx_model_dir?: string;
+  // 'bin | prompt' strings or objects; empty = built-in defaults
+  face_suite?: (string | { prompt: string; [key: string]: any })[];
+  body_suite?: (string | { prompt: string; [key: string]: any })[];
+  flex_suite?: (string | { prompt: string; [key: string]: any })[];
+  seed?: number;
+  wait_at_end_minutes?: number;
 }
 
 export interface SampleLora {
@@ -309,6 +331,7 @@ export interface ProcessConfig {
   logging: LoggingConfig;
   model: ModelConfig;
   sample: SampleConfig;
+  identity_eval?: IdentityEvalConfig;
 }
 
 export interface ConfigObject {
