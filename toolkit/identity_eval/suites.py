@@ -57,14 +57,16 @@ def _normalize(items: List[Union[str, dict]], default: List[dict]) -> List[dict]
 
 def build_slots(cfg, sample_config, use_helper: bool) -> List[dict]:
     """Slot definitions for the three suites. cfg is an IdentityEvalConfig.
-    Renderers alternate over the interleaved slot order so each card gets a
-    mix of modalities; the assignment is saved in the manifest and reused."""
-    base = sample_config.samples[0] if sample_config.samples else None
-    width = base.width if base is not None else sample_config.width
-    height = base.height if base is not None else sample_config.height
-    steps = base.sample_steps if base is not None else sample_config.sample_steps
-    guidance = base.guidance_scale if base is not None else sample_config.guidance_scale
-    neg = (base.neg if base is not None else sample_config.neg) or ""
+    Size, steps, guidance and negative prompt come from the sample config's
+    own settings (the ones the regular samples default to), unless a suite
+    item overrides them. Renderers alternate over the interleaved slot order
+    so each card gets a mix of modalities; the assignment is saved in the
+    manifest and reused."""
+    width = sample_config.width
+    height = sample_config.height
+    steps = sample_config.sample_steps
+    guidance = sample_config.guidance_scale
+    neg = sample_config.neg or ""
     seed0 = cfg.seed if cfg.seed is not None else int(sample_config.seed or 0)
 
     suites = {

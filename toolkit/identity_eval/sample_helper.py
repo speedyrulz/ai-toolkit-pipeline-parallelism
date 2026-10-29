@@ -5,10 +5,12 @@
 Started by the trainer with CUDA_VISIBLE_DEVICES pinned to the helper card, so
 the model lives on cuda:0 here. It loads the job's base model once through the
 regular model loader, and each round applies the trainer's LoRA snapshot as
-forward hooks (toolkit/inference_lora.py), at each image's network multiplier.
+forward hooks (toolkit/inference_lora.py), at each image's network multiplier,
+plus the job's extra sample LoRAs at their own strengths (on every image, the
+network-off baseline included, as the trainer does).
 
 Commands:
-  render  {items: [GenerateImageConfig kwargs], lora_path, sampler}
+  render  {items: [GenerateImageConfig kwargs], lora_path, sampler, sample_loras}
   offload / onload   move the model to cpu and back around gpu scoring
 """
 
@@ -69,6 +71,8 @@ def main():
     with torch.no_grad():
         sd.load_model()
     state = {"lora": None, "lora_path": None, "lora_mtime": None, "offloaded": False}
+    # extra sample LoRAs by path; None caches a load failure so it is not retried
+    extra_loras = {}
 
     def holder():
         return SimpleNamespace(
@@ -89,27 +93,54 @@ def main():
         state.update(lora=lora, lora_path=path, lora_mtime=mtime)
         return lora
 
-    def render(items, lora_path=None, sampler=None):
+    def attach_extra(specs):
+        attached = []
+        for spec in specs or []:
+            path = spec.get("path")
+            if not path:
+                continue
+            if path not in extra_loras:
+                try:
+                    extra = InferenceLoRA(path, name=spec.get("name")).load(holder(), status_fn=print)
+                    print(extra.report(max_unmatched=10), flush=True)
+                    extra_loras[path] = extra if extra.entries else None
+                except Exception as e:
+                    print(f"sample LoRA {path} failed to load, skipping it: {e}", flush=True)
+                    extra_loras[path] = None
+            extra = extra_loras[path]
+            if extra is None:
+                continue
+            extra.strength = float(spec.get("strength", 1.0))
+            extra.attach()
+            attached.append(extra)
+        return attached
+
+    def render(items, lora_path=None, sampler=None, sample_loras=None):
         if state["offloaded"]:
             raise RuntimeError("render while offloaded")
         lora = get_lora(lora_path)
+        extras = attach_extra(sample_loras)
         groups = {}
         for item in items:
             groups.setdefault(float(item.get("network_multiplier", 1.0)), []).append(item)
         written = []
-        with torch.no_grad():
-            for mult, group in groups.items():
-                configs = [GenerateImageConfig(**item) for item in group]
-                use_lora = lora is not None and mult != 0.0
-                if use_lora:
-                    lora.strength = mult
-                    lora.attach()
-                try:
-                    sd.generate_images(configs, sampler=sampler)
-                finally:
+        try:
+            with torch.no_grad():
+                for mult, group in groups.items():
+                    configs = [GenerateImageConfig(**item) for item in group]
+                    use_lora = lora is not None and mult != 0.0
                     if use_lora:
-                        lora.detach()
-                written.extend(c.output_path for c in configs)
+                        lora.strength = mult
+                        lora.attach()
+                    try:
+                        sd.generate_images(configs, sampler=sampler)
+                    finally:
+                        if use_lora:
+                            lora.detach()
+                    written.extend(c.output_path for c in configs)
+        finally:
+            for extra in extras:
+                extra.detach()
         flush()
         return {"written": written}
 

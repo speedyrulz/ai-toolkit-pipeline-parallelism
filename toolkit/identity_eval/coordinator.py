@@ -105,6 +105,11 @@ class IdentityEval:
                 "guidance_rescale": self.sample_config.guidance_rescale,
                 "network_multiplier": self.sample_config.network_multiplier,
             },
+            # extra sample LoRAs are part of every eval image, baseline included
+            "sample_loras": [
+                {"file": M.fingerprint_model(l["path"]), "strength": float(l.get("strength", 1.0))}
+                for l in (getattr(self.sample_config, "loras", None) or [])
+            ],
             "references": {r: M.hash_images(M.list_images([self.references[r]])) for r in ROLES},
             "metric_versions": self.metric_versions,
             "target_quantile": self.cfg.target_quantile,

@@ -383,11 +383,16 @@ class BaseSDTrainProcess(BaseTrainProcess):
             item['_renderer'] = 'helper' if i % 2 == 1 else 'main'
             gen_img_config_list.append(item)
 
+        # identity eval suites ride along with this round's samples, with the
+        # same sampler settings and extra sample LoRAs (the step-0 baseline
+        # has them too, so only the trained network differs between rounds)
         identity_round = (
             self.identity_eval is not None
             and not is_first
             and self.identity_eval.is_eval_step(step, final=final)
         )
+        if identity_round:
+            gen_img_config_list.extend(self.identity_eval.round_items(step))
 
         # if we have an ema, set it to validation mode
         if self.ema is not None:
@@ -404,9 +409,6 @@ class BaseSDTrainProcess(BaseTrainProcess):
         finally:
             for lora in sample_loras:
                 lora.detach()
-        if identity_round:
-            # after the sample LoRAs come off: the step-0 baseline never had them
-            self._render_items(self.identity_eval.round_items(step), sample_config)
 
         if self.adapter is not None and isinstance(self.adapter, CustomAdapter):
             self.adapter.is_sampling = False
@@ -431,11 +433,12 @@ class BaseSDTrainProcess(BaseTrainProcess):
 
     def _helper_compatible(self, sample_config) -> bool:
         """Whether the sample helper can reproduce this job's sampling: it
-        loads the plain base model and applies the network as linear LoRA
-        hooks, so anything beyond that stays on the trainer's card."""
+        loads the plain base model and applies the network and the extra
+        sample LoRAs as linear LoRA hooks, so anything beyond that stays on
+        the trainer's card."""
         if self.is_fine_tuning or self.embedding is not None or self.adapter is not None:
             return False
-        if sample_config.loras or self.model_config.refiner_name_or_path is not None:
+        if self.model_config.refiner_name_or_path is not None:
             return False
         if self.network_config is not None and (
             self.network_config.conv or self.network_config.type.lower() not in ('lora', 'lokr')
@@ -478,7 +481,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 finally:
                     self.network.multiplier = prev_multiplier
             strip = [{k: v for k, v in i.items() if not k.startswith('_')} for i in helper_items]
-            self.sample_helper.render_async(strip, lora_path, sample_config.sampler)
+            self.sample_helper.render_async(strip, lora_path, sample_config.sampler, sample_config.loras)
 
         try:
             if main_items:
@@ -580,7 +583,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
         if second_gpu is not None:
             if not self._helper_compatible(self.sample_config):
                 print_acc("This job uses features the sample helper does not reproduce "
-                          "(adapters, embeddings, refiner, sample LoRAs or conv/LoRM networks); "
+                          "(adapters, embeddings, refiner or conv/LoRM networks); "
                           "sampling stays on the trainer's gpu")
             else:
                 from toolkit.identity_eval.helper_client import SampleHelper
@@ -618,8 +621,17 @@ class BaseSDTrainProcess(BaseTrainProcess):
         atexit.register(ie.close)
         if self.ema is not None:
             self.ema.eval()
+        def render_baseline(items):
+            # same extra sample LoRAs as every later round
+            sample_loras = self._attach_sample_loras(self.sample_config)
+            try:
+                self._render_items(items, self.sample_config)
+            finally:
+                for lora in sample_loras:
+                    lora.detach()
+
         try:
-            started = ie.start(lambda items: self._render_items(items, self.sample_config), self._gpu_session)
+            started = ie.start(render_baseline, self._gpu_session)
         finally:
             if self.ema is not None:
                 self.ema.train()

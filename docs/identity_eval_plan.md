@@ -43,9 +43,14 @@ wait, prompt pre-encoding for when text encoders are unloaded (`SDTrainer`
 
 ### Step 0 baseline
 
-- Rendered with `network_multiplier=0`, independent of `skip_first_sample`.
+- Rendered with `network_multiplier=0`, independent of `skip_first_sample`,
+  with the same sampler settings and extra sample LoRAs as every later round:
+  only the trained network differs between rounds.
+- Eval images use the sample config's own settings (sampler, width, height,
+  steps, guidance, negative prompt), unless a suite item overrides them.
 - Stored in `identity_eval/baseline/` with a manifest of hashes (base model,
-  prompts, seeds, sampler settings, evaluator version).
+  prompts, seeds, sampler settings, sample LoRAs and strengths, evaluator
+  version).
 - On resume: anchors are reloaded, never recomputed. A hash mismatch blocks
   scoring with a visible `CALIBRATION_INVALID` warning.
 
@@ -101,9 +106,12 @@ adapters).
   the same card keeps the paired baseline (D1) valid.
 - Splits every sample round (regular samples and eval suites), configured by
   `sample.helper_gpu: <physical index>`; works without identity eval too.
+- Applies the job's extra sample LoRAs (`sample.loras`) as hooks at their
+  strengths, like the trainer does.
 - Falls back to rendering everything on `cuda:0`, with a log line, when the
-  job uses something the helper does not reproduce (custom adapters, refiner,
-  sample LoRAs, sharding) or when the helper fails to start.
+  job uses something the helper does not reproduce (custom adapters,
+  embeddings, refiner, conv/LoRM networks, sharding) or when the helper fails
+  to start.
 
 ### Unload / reload of the training model
 
