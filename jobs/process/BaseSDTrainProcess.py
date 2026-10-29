@@ -274,6 +274,8 @@ class BaseSDTrainProcess(BaseTrainProcess):
         self.additional_logs = {}
         # cached latents, prompt embeds, and fixed noise for validation
         self._validation_cache = None
+        # sample-only LoRAs, loaded once and kept on cpu, keyed by path
+        self._sample_loras = {}
 
     def post_process_generate_image_config_list(self, generate_image_config_list: List[GenerateImageConfig]):
         # override in subclass
@@ -382,12 +384,16 @@ class BaseSDTrainProcess(BaseTrainProcess):
         )
         files_before = set(os.listdir(sample_folder)) if likeness_on and os.path.isdir(sample_folder) else set()
 
-        # send to be generated
-        self.sd.generate_images(gen_img_config_list, sampler=sample_config.sampler)
+        sample_loras = self._attach_sample_loras(sample_config)
+        try:
+            # send to be generated
+            self.sd.generate_images(gen_img_config_list, sampler=sample_config.sampler)
 
-        if likeness_on:
-            self._likeness_sample_round(step, sample_config, sample_folder, files_before)
-
+            if likeness_on:
+                self._likeness_sample_round(step, sample_config, sample_folder, files_before)
+        finally:
+            for lora in sample_loras:
+                lora.detach()
 
         if self.adapter is not None and isinstance(self.adapter, CustomAdapter):
             self.adapter.is_sampling = False
@@ -395,6 +401,45 @@ class BaseSDTrainProcess(BaseTrainProcess):
         if self.ema is not None:
             self.ema.train()
         print_acc("") # add a line break
+
+    def _attach_sample_loras(self, sample_config):
+        """Attach the sample config's extra LoRAs as forward-hook sidechains at
+        their strengths. They run alongside the trained network without touching
+        any weights; the caller detaches them once sampling is done."""
+        if not sample_config.loras:
+            return []
+        from types import SimpleNamespace
+        from toolkit.inference_lora import InferenceLoRA
+
+        attached = []
+        for spec in sample_config.loras:
+            path = spec['path']
+            lora = self._sample_loras.get(path)
+            if lora is None:
+                # InferenceLoRA resolves modules by name under .model / .text_encoder
+                holder = SimpleNamespace(
+                    model=self.sd.unet_unwrapped,
+                    text_encoder=self.sd.text_encoder,
+                    convert_lora_weights_before_load=getattr(self.sd, 'convert_lora_weights_before_load', None),
+                )
+                try:
+                    lora = InferenceLoRA(path, name=spec.get('name')).load(holder, status_fn=print_acc)
+                    print_acc(lora.report(max_unmatched=10))
+                    if not lora.entries:
+                        print_acc(f"Sample LoRA {lora.name} matched no modules of this model, skipping it")
+                except Exception as e:
+                    print_acc(f"Sample LoRA {path} failed to load, skipping it: {e}")
+                    lora = None
+                # cache failures too so a bad path is not retried every sample
+                self._sample_loras[path] = lora
+            if lora is None or not lora.entries:
+                continue
+            lora.strength = float(spec.get('strength', 1.0))
+            lora.attach()
+            attached.append(lora)
+        if attached:
+            print_acc("Sampling with LoRA(s): " + ", ".join(f"{l.name} @ {l.strength:g}" for l in attached))
+        return attached
 
     # ------------------------------------------------------------------
     # Character likeness scoring (toolkit/likeness)
