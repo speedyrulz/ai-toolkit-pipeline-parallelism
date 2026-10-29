@@ -31,6 +31,7 @@ from toolkit import train_tools
 from toolkit.config_modules import ModelConfig, GenerateImageConfig, ModelArch
 from toolkit.metadata import get_meta_for_safetensors
 from toolkit.models.decorator import Decorator
+from toolkit.unloader import FakeTextEncoder
 from toolkit.paths import KEYMAPS_ROOT
 from toolkit.prompt_utils import inject_trigger_into_prompt, PromptEmbeds, concat_prompt_embeds
 from toolkit.reference_adapter import ReferenceAdapter
@@ -1115,13 +1116,35 @@ class StableDiffusion:
         self.vae.requires_grad_(False)
         VAE_SCALE_FACTOR = 2 ** (len(self.vae.config['block_out_channels']) - 1)
         self.vae_scale_factor = VAE_SCALE_FACTOR
-        self.unet.to(self.device_torch, dtype=dtype)
-        self.unet.requires_grad_(False)
-        self.unet.eval()
-
         # every resident component joins the v2 mixin system (in-place class
         # adoption for components the pipeline loaders built directly)
         _adopt_v2(self.unet)
+        if self.model_config.pipeline_sharding:
+            if not isinstance(self.unet, UNet2DConditionModel):
+                raise ValueError(
+                    "pipeline_sharding is only supported for unet models (SD1/SD2/SDXL) "
+                    "in this loader"
+                )
+            from toolkit.pipeline_sharding import PipelineShardManager, resolve_pipeline_devices
+
+            devices = resolve_pipeline_devices(
+                self.device_torch, self.model_config.pipeline_devices, print_acc
+            )
+            print_acc(f"Sharding unet across gpus: {devices}")
+            # down and up blocks are spread over the gpus; the mid block, time
+            # embeddings and conv in/out stay on the primary device. Up blocks
+            # pull the skip connections they consume onto their own device.
+            PipelineShardManager.attach(
+                self.unet,
+                devices=devices,
+                block_names=["down_blocks", "up_blocks"],
+                dtype=dtype,
+                balance=self.model_config.pipeline_balance,
+            )
+        else:
+            self.unet.to(self.device_torch, dtype=dtype)
+        self.unet.requires_grad_(False)
+        self.unet.eval()
         _adopt_v2(self.vae)
         if isinstance(text_encoder, list):
             for te in text_encoder:
@@ -1343,11 +1366,13 @@ class StableDiffusion:
 
             # TODO add clip skip
             if self.is_xl:
+                # unloaded TEs are FakeTextEncoder stubs with no .config; diffusers expects None
+                # and then reads the projection dim from the pooled embeds instead
                 pipeline = Pipe(
                     vae=self.vae,
                     unet=self.unet,
-                    text_encoder=self.text_encoder[0],
-                    text_encoder_2=self.text_encoder[1],
+                    text_encoder=None if isinstance(self.text_encoder[0], FakeTextEncoder) else self.text_encoder[0],
+                    text_encoder_2=None if isinstance(self.text_encoder[1], FakeTextEncoder) else self.text_encoder[1],
                     tokenizer=self.tokenizer[0],
                     tokenizer_2=self.tokenizer[1],
                     scheduler=noise_scheduler,
