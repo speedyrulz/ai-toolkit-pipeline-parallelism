@@ -18,6 +18,7 @@ import {
 import Card from '@/components/Card';
 import { X, Copy, Wand2, SquareDashed, Info, Plus } from 'lucide-react';
 import LoraBrowserModal, { LoraPick } from '@/components/generate/LoraBrowserModal';
+import { ModelBrowseButton } from '@/components/ModelBrowserModal';
 import { openDoc } from '@/components/DocModal';
 import { openUpsamplePromptsModal, toAspectRatio } from '@/components/UpsamplePromptsModal';
 import { openPromptBoxEditor } from '@/components/PromptBoxEditorModal';
@@ -311,6 +312,12 @@ export default function SimpleJob({
               }}
               placeholder=""
               required
+              suffix={
+                <ModelBrowseButton
+                  value={jobConfig.config.process[0].model.name_or_path}
+                  onPick={p => setJobConfig(p, 'config.process[0].model.name_or_path')}
+                />
+              }
             />
             {modelArch?.additionalSections?.includes('model.model_kwargs.instruction') && (
               <TextAreaInput
