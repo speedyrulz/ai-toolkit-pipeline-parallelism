@@ -2139,10 +2139,18 @@ class BaseSDTrainProcess(BaseTrainProcess):
         if sched is not None and hasattr(sched, 'base_lrs'):
             sched.base_lrs = [lr * ratio for lr in sched.base_lrs]
         # automagic-family: the group lr is only the starting point; the live
-        # lr lives in per-param state tensors
+        # lr lives in per-param state tensors, kept inside the group's
+        # min_lr/max_lr like the optimizer's own controller does
+        bounds = {}
+        for group in self.optimizer.param_groups:
+            if 'min_lr' in group and 'max_lr' in group:
+                for p in group['params']:
+                    bounds[p] = (group['min_lr'], group['max_lr'])
         for p, st in getattr(self.optimizer, 'state', {}).items():
             if isinstance(st, dict) and isinstance(st.get('lr'), torch.Tensor):
                 st['lr'].mul_(ratio)
+                if p in bounds:
+                    st['lr'].clamp_(min=bounds[p][0], max=bounds[p][1])
 
     def _alr_begin_segment(self):
         if not hasattr(self, '_alr_current_lr'):

@@ -681,6 +681,8 @@ class Automagic3(torch.optim.Optimizer):
                     st["lr"] = st["lr"].to(torch.float32)
                     if med is not None:
                         st["lr"].copy_(med.to(st["lr"].device))
+                    # the checkpoint may predate tighter bounds; apply them now
+                    st["lr"].clamp_(min=group["min_lr"], max=group["max_lr"])
                 # Sign history: keep it when its geometry matches the current
                 # config (the parent cast it to param dtype; recover by shape).
                 # On any mismatch (e.g. a checkpoint from an older window
