@@ -31,6 +31,7 @@ from toolkit import train_tools
 from toolkit.config_modules import ModelConfig, GenerateImageConfig, ModelArch
 from toolkit.metadata import get_meta_for_safetensors
 from toolkit.models.decorator import Decorator
+from toolkit.unloader import FakeTextEncoder
 from toolkit.paths import KEYMAPS_ROOT
 from toolkit.prompt_utils import inject_trigger_into_prompt, PromptEmbeds, concat_prompt_embeds
 from toolkit.reference_adapter import ReferenceAdapter
@@ -1343,11 +1344,13 @@ class StableDiffusion:
 
             # TODO add clip skip
             if self.is_xl:
+                # unloaded TEs are FakeTextEncoder stubs with no .config; diffusers expects None
+                # and then reads the projection dim from the pooled embeds instead
                 pipeline = Pipe(
                     vae=self.vae,
                     unet=self.unet,
-                    text_encoder=self.text_encoder[0],
-                    text_encoder_2=self.text_encoder[1],
+                    text_encoder=None if isinstance(self.text_encoder[0], FakeTextEncoder) else self.text_encoder[0],
+                    text_encoder_2=None if isinstance(self.text_encoder[1], FakeTextEncoder) else self.text_encoder[1],
                     tokenizer=self.tokenizer[0],
                     tokenizer_2=self.tokenizer[1],
                     scheduler=noise_scheduler,
