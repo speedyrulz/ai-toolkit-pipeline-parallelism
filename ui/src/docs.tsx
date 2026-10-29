@@ -245,6 +245,25 @@ const docs: { [key: string]: ConfigDoc } = {
       </>
     ),
   },
+  'model.pipeline_sharding': {
+    title: 'Multi-GPU (Pipeline Sharding)',
+    description: (
+      <>
+        Splits the model across several GPUs in this one training job, so each card only holds part of the weights. This
+        lets you train with more VRAM headroom than a single card has, without offloading to CPU RAM.
+        <br />
+        <br />
+        The model's blocks are divided between the selected GPUs by size, and activations are passed from one GPU to the
+        next during each step. GPU #0 is always the primary GPU: it also holds the text encoders, VAE and the rest of
+        the model, and is where the loss is computed. When this is on, the job uses the selected GPUs instead of the
+        single GPU ID chosen above.
+        <br />
+        <br />
+        With two GPUs you can set how much of the split goes to the primary GPU. Lower it if GPU #0 runs out of memory
+        first, since it also carries the text encoders and VAE. Cannot be combined with Low VRAM or Layer Offloading.
+      </>
+    ),
+  },
   'model.qie.match_target_res': {
     title: 'Match Target Res',
     description: (

@@ -510,6 +510,75 @@ export default function SimpleJob({
                 )}
               </>
             )}
+            {modelArch?.additionalSections?.includes('model.pipeline_sharding') &&
+              !isMac() &&
+              (gpuList.length > 1 || jobConfig.config.process[0].model.pipeline_sharding) && (
+                <div className="pt-2">
+                  <Checkbox
+                    label="Multi-GPU (Pipeline Sharding)"
+                    checked={jobConfig.config.process[0].model.pipeline_sharding || false}
+                    onChange={value => setJobConfig(value, 'config.process[0].model.pipeline_sharding')}
+                    docKey="model.pipeline_sharding"
+                  />
+                  {jobConfig.config.process[0].model.pipeline_sharding &&
+                    (() => {
+                      const model = jobConfig.config.process[0].model;
+                      const allDevices: string[] = gpuList.map((gpu: any) => `cuda:${gpu.index}`);
+                      // unset means every gpu; cuda:0 is always the primary device
+                      const selected = (model.pipeline_devices ?? allDevices).filter(d => allDevices.includes(d));
+                      const setDevices = (devices: string[]) => {
+                        const ordered = allDevices.filter(d => d === 'cuda:0' || devices.includes(d));
+                        setJobConfig(
+                          ordered.length === allDevices.length ? undefined : ordered,
+                          'config.process[0].model.pipeline_devices',
+                        );
+                        // balance ratios are per device; reset when the device list changes
+                        setJobConfig(undefined, 'config.process[0].model.pipeline_balance');
+                      };
+                      return (
+                        <div className="pt-2 space-y-2">
+                          <FormGroup label="GPUs">
+                            <div className="flex flex-wrap gap-x-4 gap-y-2">
+                              {gpuList.map((gpu: any) => {
+                                const dev = `cuda:${gpu.index}`;
+                                const isPrimary = gpu.index === 0;
+                                const isChecked = isPrimary || selected.includes(dev);
+                                // sharding needs at least 2 gpus
+                                const isLastSecondary = isChecked && selected.filter(d => d !== 'cuda:0').length <= 1;
+                                return (
+                                  <Checkbox
+                                    key={dev}
+                                    label={`GPU #${gpu.index}${isPrimary ? ' (primary)' : ''}`}
+                                    checked={isChecked}
+                                    disabled={isPrimary || isLastSecondary}
+                                    onChange={value =>
+                                      setDevices(value ? [...selected, dev] : selected.filter(d => d !== dev))
+                                    }
+                                  />
+                                );
+                              })}
+                            </div>
+                          </FormGroup>
+                          {selected.length === 2 && (
+                            <SliderInput
+                              label={`GPU #${selected[0].split(':')[1]} Share %`}
+                              value={Math.round((model.pipeline_balance?.[0] ?? 0.5) * 100)}
+                              onChange={value =>
+                                setJobConfig(
+                                  value === 50 ? undefined : [value / 100, (100 - value) / 100],
+                                  'config.process[0].model.pipeline_balance',
+                                )
+                              }
+                              min={10}
+                              max={90}
+                              step={1}
+                            />
+                          )}
+                        </div>
+                      );
+                    })()}
+                </div>
+              )}
           </Card>
           {disableSections.includes('model.quantize') ? null : (
             <Card title="Quantize / Compile">

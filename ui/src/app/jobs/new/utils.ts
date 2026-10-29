@@ -59,6 +59,16 @@ export const handleModelArchChange = (
     }
   }
 
+  // pipeline sharding is only wired up for some archs; drop it for the rest
+  if (
+    !newArch?.additionalSections?.includes('model.pipeline_sharding') &&
+    jobConfig.config.process[0].model.pipeline_sharding
+  ) {
+    setJobConfig(false, 'config.process[0].model.pipeline_sharding');
+    setJobConfig(undefined, 'config.process[0].model.pipeline_devices');
+    setJobConfig(undefined, 'config.process[0].model.pipeline_balance');
+  }
+
   const numDatasets = jobConfig.config.process[0].datasets.length;
 
   let currentDefaults = expandDatasetDefaults(currentArch.defaults || {}, numDatasets);

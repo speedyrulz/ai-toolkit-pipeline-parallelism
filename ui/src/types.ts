@@ -222,6 +222,9 @@ export interface ModelConfig {
   layer_offloading?: boolean;
   layer_offloading_transformer_percent?: number;
   layer_offloading_text_encoder_percent?: number;
+  pipeline_sharding?: boolean;
+  pipeline_devices?: string[];
+  pipeline_balance?: number[];
   assistant_lora_path?: string;
   unconditional_lora_path?: string;
   compile?: boolean;

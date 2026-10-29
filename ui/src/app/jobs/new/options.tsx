@@ -31,6 +31,7 @@ type AdditionalSections =
   | 'model.multistage'
   | 'model.layer_offloading'
   | 'model.low_vram'
+  | 'model.pipeline_sharding'
   | 'model.qie.match_target_res'
   | 'model.assistant_lora_path'
   | 'model.unconditional_lora_path'
