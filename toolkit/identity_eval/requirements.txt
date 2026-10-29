@@ -1,0 +1,6 @@
+# Identity eval scoring worker, on top of the toolkit's own requirements
+# (torch, transformers, huggingface_hub, opencv, numpy, pillow, safetensors).
+# onnxruntime-gpu 1.31 targets CUDA 13 and uses the CUDA runtime torch loads.
+onnxruntime-gpu>=1.31
+omegaconf
+easydict

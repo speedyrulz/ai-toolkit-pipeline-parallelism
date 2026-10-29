@@ -173,6 +173,14 @@ class IdentityEvalConfig:
         self.face_weight: float = float(kwargs.get('face_weight', 0.55))
         self.body_weight: float = float(kwargs.get('body_weight', 0.45))
         self.target_quantile: float = float(kwargs.get('target_quantile', 0.75))
+        # flex guard: warn when prompt adherence (SigLIP, x100) drops more than
+        # this many points below step 0
+        self.flex_max_drop: float = float(kwargs.get('flex_max_drop', 3.0))
+        # scoring backend: 'auto' = real models where available, 'stub' = placeholder
+        self.backend: str = kwargs.get('backend', 'auto') or 'auto'
+        # model overrides for the face worker (identity_eval/worker/face.py
+        # DEFAULT_MODELS): face_pack_dir, cvlface_repo, aligner_repo, flex_model
+        self.models: dict = kwargs.get('models', {}) or {}
 
     @staticmethod
     def _gpu(value) -> Optional[int]:

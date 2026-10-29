@@ -7,7 +7,8 @@ import { apiClient } from '@/utils/api';
 import { encodeFilePathForUrl } from '@/utils/basic';
 
 // Identity eval results (toolkit/identity_eval): headline face / body /
-// identity scores, a per-round table, and baseline-vs-round images per slot.
+// identity scores, the flex (prompt adherence) change from step 0, a per-round
+// table, and baseline-vs-round images per slot.
 
 interface Modality {
   score: number | null;
@@ -21,6 +22,7 @@ interface Round {
   face: Modality;
   body: Modality;
   identity: { score: number | null; valid: boolean };
+  flex?: { delta: number | null; valid_slots: number; slots: number };
   over_target_slots: number;
   warnings: string[];
   seconds: number;
@@ -31,8 +33,12 @@ interface SlotScore {
   bin: string;
   status: string;
   reason: string | null;
-  score: number | null;
+  score?: number | null;
   max_ratio?: number | null;
+  baseline?: 'paired' | 'pooled' | number | null;
+  extra?: { yaw?: number; view?: string; det_score?: number } | null;
+  features?: Record<string, { raw: number | null; score: number | null }>;
+  delta?: number | null;
 }
 
 interface IdentityData {
@@ -53,6 +59,8 @@ interface IdentityData {
 }
 
 const fmt = (v: number | null | undefined) => (v === null || v === undefined ? '—' : v.toFixed(1));
+const signed = (v: number | null | undefined) =>
+  v === null || v === undefined ? '—' : `${v >= 0 ? '+' : ''}${v.toFixed(1)}`;
 const pct = (v: number | null | undefined) => (v === null || v === undefined ? '—' : `${Math.round(v * 100)}%`);
 
 function Headline({ label, value, sub }: { label: string; value: number | null | undefined; sub: string }) {
@@ -64,6 +72,22 @@ function Headline({ label, value, sub }: { label: string; value: number | null |
         <span className="text-base text-gray-500"> / 100</span>
       </div>
       <div className="text-xs text-gray-400 mt-1">{sub}</div>
+    </div>
+  );
+}
+
+function FlexHeadline({ round }: { round: Round | null }) {
+  const f = round?.flex;
+  return (
+    <div className="bg-gray-900 rounded-lg p-4 flex-1 min-w-[160px]">
+      <div className="text-xs uppercase text-gray-500">Flex</div>
+      <div className="text-3xl font-semibold text-gray-100">
+        {signed(f?.delta)}
+        <span className="text-base text-gray-500"> vs step 0</span>
+      </div>
+      <div className="text-xs text-gray-400 mt-1">
+        {f ? `prompt adherence, ${f.valid_slots}/${f.slots} slots` : 'prompt adherence'}
+      </div>
     </div>
   );
 }
@@ -114,14 +138,16 @@ export default function JobIdentity({ job }: { job: Job }) {
   const latest = rounds.length ? rounds[rounds.length - 1] : null;
   const sel = data.selected;
   const perImage = sel?.per_image ?? {};
-  const stub = Object.values(data.metric_versions ?? {}).some(v => v.includes('stub'));
+  const stubRoles = Object.entries(data.metric_versions ?? {})
+    .filter(([, v]) => v.includes('stub'))
+    .map(([k]) => k);
 
   return (
     <div className="space-y-6">
-      {stub && (
+      {stubRoles.length > 0 && (
         <p className="text-sm text-yellow-500">
-          Placeholder scorer (metric version {Object.values(data.metric_versions ?? {}).join(', ')}): these numbers
-          exercise the pipeline and do not measure identity yet.
+          Placeholder scorer for {stubRoles.join(' and ')}: those numbers exercise the pipeline and do not measure
+          identity yet{stubRoles.length === 1 && stubRoles[0] === 'body' ? ' (body scoring arrives in Phase 2)' : ''}.
         </p>
       )}
       <div className="flex flex-wrap gap-4">
@@ -134,6 +160,7 @@ export default function JobIdentity({ job }: { job: Job }) {
             latest ? (latest.identity.valid ? `step ${latest.step}` : 'N/A: a modality is missing') : 'no rounds yet'
           }
         />
+        <FlexHeadline round={latest} />
       </div>
       {latest?.warnings?.length ? (
         <ul className="text-sm text-yellow-500 list-disc pl-5">
@@ -155,6 +182,7 @@ export default function JobIdentity({ job }: { job: Job }) {
                 <th className="pr-4">Face</th>
                 <th className="pr-4">Body</th>
                 <th className="pr-4">Identity</th>
+                <th className="pr-4">Flex</th>
                 <th className="pr-4">Coverage (face / body)</th>
                 <th className="pr-4">Past target</th>
                 <th className="pr-4">Time</th>
@@ -171,6 +199,7 @@ export default function JobIdentity({ job }: { job: Job }) {
                   <td className="pr-4">{fmt(r.face.score)}</td>
                   <td className="pr-4">{fmt(r.body.score)}</td>
                   <td className="pr-4">{fmt(r.identity.score)}</td>
+                  <td className="pr-4">{signed(r.flex?.delta)}</td>
                   <td className="pr-4">
                     {pct(r.face.coverage)} / {pct(r.body.coverage)}
                   </td>
@@ -200,11 +229,36 @@ export default function JobIdentity({ job }: { job: Job }) {
                     <div className="truncate" title={s.prompt}>
                       {s.prompt}
                     </div>
-                    {s.modality === 'flex' ? (
-                      <div className="mt-1 text-gray-500">flexibility scoring arrives in Phase 1</div>
+                    {s.modality === 'flex' && r ? (
+                      <div className="mt-1">
+                        adherence <span className="text-gray-100">{signed(r.delta)}</span> vs step 0
+                        {r.status !== 'VALID' && (
+                          <span className="text-yellow-500">
+                            {' '}
+                            · {r.status}
+                            {r.reason ? `: ${r.reason}` : ''}
+                          </span>
+                        )}
+                      </div>
                     ) : r ? (
                       <div className="mt-1">
                         score <span className="text-gray-100">{fmt(r.score)}</span>
+                        {r.features && (
+                          <span className="text-gray-500">
+                            {' ('}
+                            {Object.entries(r.features)
+                              .map(([k, v]) => `${k.replace(/^face_/, '')} ${fmt(v.score)}`)
+                              .join(', ')}
+                            {')'}
+                          </span>
+                        )}
+                        {r.extra?.view && (
+                          <span className="text-gray-500">
+                            {' '}
+                            · seen as {r.extra.view} ({Math.round(r.extra.yaw ?? 0)}°)
+                          </span>
+                        )}
+                        {r.baseline === 'pooled' && <span className="text-yellow-500"> · median baseline</span>}
                         {r.max_ratio !== undefined && r.max_ratio !== null && r.max_ratio > 1 && (
                           <span className="text-yellow-500"> · {Math.round(r.max_ratio * 100)}% of target</span>
                         )}

@@ -51,6 +51,7 @@ class IdentityEval:
         self.uses_helper_renderer = use_helper
         self.slot_by_id = {s["id"]: s for s in self.slots}
         self.scored_slots = [s for s in self.slots if s["modality"] in ROLES]
+        self.flex_slots = [s for s in self.slots if s["modality"] == "flex"]
         self.model_fingerprint = model_fingerprint
 
         face_gpu = cfg.face_gpu if cfg.face_gpu is not None else trainer_gpu
@@ -63,6 +64,8 @@ class IdentityEval:
         }
         self.workers: Dict[str, JsonProcess] = {}
         self.features: Dict[str, List[str]] = {}
+        self.weights: Dict[str, Dict[str, float]] = {}
+        self.model_ids: Dict[str, dict] = {}
         self.metric_versions: Dict[str, str] = {}
         self.anchors: Optional[dict] = None
         self.calibration_id: Optional[str] = None
@@ -86,15 +89,19 @@ class IdentityEval:
             print_acc(f"Identity eval: starting {role} worker on {where}")
             w = JsonProcess(
                 f"identity {role} worker",
-                [python, "-u", WORKER_MAIN, "--role", role, "--device", device],
+                [python, "-u", WORKER_MAIN, "--role", role, "--device", device,
+                 "--backend", self.cfg.backend, "--models", json.dumps(self.cfg.models)],
                 os.path.join(self.root, f"worker_{role}.log"),
                 env=gpu_env(gpu),
             )
+            # the face worker loads its models before it answers (first run downloads them)
             w.start()
             info = w.request("info", timeout=60)
             self.workers[role] = w
             self.features[role] = info["features"]
             self.metric_versions[role] = info["metric_version"]
+            self.weights[role] = info.get("weights") or {f: 1.0 for f in info["features"]}
+            self.model_ids[role] = info.get("models") or {}
 
     def _fingerprint(self) -> dict:
         return {
@@ -112,6 +119,7 @@ class IdentityEval:
             ],
             "references": {r: M.hash_images(M.list_images([self.references[r]])) for r in ROLES},
             "metric_versions": self.metric_versions,
+            "models": self.model_ids,
             "target_quantile": self.cfg.target_quantile,
         }
 
@@ -186,6 +194,7 @@ class IdentityEval:
             "baselines": baselines,
             "baseline_status": baseline_status,
             "reference_counts": {r: prepared[r]["reference_count"] for r in ROLES},
+            "reference_views": {r: prepared[r].get("views") for r in ROLES},
             "excluded_references": {r: prepared[r]["excluded"] for r in ROLES},
         }
         self.calibration_id = cal_id
@@ -194,6 +203,8 @@ class IdentityEval:
             "calibration_id": cal_id,
             "metric_versions": self.metric_versions,
             "features": self.features,
+            "weights": self.weights,
+            "models": self.model_ids,
             "gpus": self.gpus,
             "references": self.references,
             "holdout_references": self.cfg.holdout_references,
@@ -271,12 +282,22 @@ class IdentityEval:
         else:
             yield
 
+    @staticmethod
+    def flex_text(prompt: str) -> str:
+        """Prompt-adherence text: the suite prompt without the identity token."""
+        return " ".join(prompt.replace("[trigger]", "a person").split())
+
     def _image_list(self, folder: str) -> Dict[str, List[dict]]:
         out = {r: [] for r in ROLES}
-        for s in self.scored_slots:
+        for s in self.scored_slots + self.flex_slots:
             path = os.path.join(folder, s["modality"], f"{s['id']}.png")
-            if os.path.exists(path):
-                out[s["modality"]].append({"slot": s["id"], "path": path})
+            if not os.path.exists(path):
+                continue
+            item = {"slot": s["id"], "path": path, "modality": s["modality"]}
+            if s["modality"] == "flex":
+                item["prompt"] = self.flex_text(s["prompt"])
+            # the face worker owns the flex suite
+            out["face" if s["modality"] == "flex" else s["modality"]].append(item)
         return out
 
     def _score_images(self, images: Dict[str, List[dict]]) -> Dict[str, dict]:
@@ -352,17 +373,25 @@ class IdentityEval:
     def _finish_round(self, step: int, raw: Dict[str, dict], seconds: float) -> Optional[dict]:
         a = self.anchors
         per_image, by_modality, over_target = {}, {r: [] for r in ROLES}, 0
+        pooled = {r: self._pooled_baseline(r) for r in ROLES}
         for s in self.scored_slots:
             role = s["modality"]
-            weights = {f: 1.0 for f in self.features[role]}
+            weights = self.weights[role]
             r = raw.get(s["id"], {"status": S.FAILED, "reason": "image missing", "raws": {}})
             entry = {"modality": role, "bin": s["bin"], "status": r["status"], "reason": r.get("reason"),
-                     "score": None}
+                     "score": None, "extra": r.get("extra")}
             if r["status"] == S.VALID:
                 base = a["baselines"].get(s["id"])
                 if base is None:
+                    # the base model missed this slot at step 0 (e.g. no face):
+                    # fall back to the suite's median baseline, flagged
+                    base = pooled[role]
+                    entry["baseline"] = "pooled" if base else None
+                else:
+                    entry["baseline"] = "paired"
+                if not base:
                     entry["status"] = S.UNCALIBRATED
-                    entry["reason"] = "baseline image was not scorable"
+                    entry["reason"] = "no scorable baseline image in this suite"
                 else:
                     res = S.score_slot(r["raws"], base, a["targets"], weights)
                     entry.update(res)
@@ -371,11 +400,19 @@ class IdentityEval:
             per_image[s["id"]] = entry
             by_modality[role].append({"bin": s["bin"], "score": entry["score"]})
 
+        flex = self._flex(raw, per_image)
         agg = {r: S.aggregate(by_modality[r], len(by_modality[r])) for r in ROLES}
         identity = S.fuse(agg["face"]["score"], agg["body"]["score"], self.cfg.face_weight, self.cfg.body_weight)
         warnings = []
         if over_target:
             warnings.append(f"{over_target} slot(s) past the reference target: possible memorization")
+        pooled_slots = [k for k, v in per_image.items() if v.get("baseline") == "pooled"]
+        if pooled_slots:
+            warnings.append(f"{len(pooled_slots)} slot(s) use the suite's median step-0 baseline "
+                            f"(their own step-0 image was not scorable): {', '.join(pooled_slots)}")
+        if flex["delta"] is not None and flex["delta"] < -self.cfg.flex_max_drop:
+            warnings.append(f"prompt adherence {flex['delta']:+.1f} vs step 0 (flex suite): "
+                            "the LoRA may be overriding prompts")
         if not self.cfg.holdout_references:
             warnings.append("no holdout references")
         summary = {
@@ -385,6 +422,7 @@ class IdentityEval:
             "face": agg["face"],
             "body": agg["body"],
             "identity": {"score": identity, "valid": identity is not None, "formula": "weighted_geomean_v1"},
+            "flex": flex,
             "over_target_slots": over_target,
             "warnings": warnings,
             "seconds": round(seconds, 1),
@@ -400,7 +438,8 @@ class IdentityEval:
             return "N/A" if v is None else f"{v:.1f}"
         print_acc(f"Identity @ step {step}: face {fmt(agg['face']['score'])} "
                   f"({agg['face']['coverage']:.0%}) | body {fmt(agg['body']['score'])} "
-                  f"({agg['body']['coverage']:.0%}) | identity {fmt(identity)}  [{seconds:.0f}s]")
+                  f"({agg['body']['coverage']:.0%}) | identity {fmt(identity)} | flex "
+                  f"{'N/A' if flex['delta'] is None else format(flex['delta'], '+.1f')}  [{seconds:.0f}s]")
         for w in warnings[:1]:
             print_acc(f"Identity eval warning: {w}")
         metrics = {}
@@ -410,7 +449,36 @@ class IdentityEval:
             metrics["identity/body"] = agg["body"]["score"]
         if identity is not None:
             metrics["identity/overall"] = identity
+        if flex["delta"] is not None:
+            metrics["identity/flex"] = flex["delta"]
         return {"step": step, "metrics": metrics}
+
+    def _pooled_baseline(self, role: str) -> Dict[str, float]:
+        """Per-feature median of the paired baselines of one suite."""
+        rows = [self.anchors["baselines"][s["id"]] for s in self.scored_slots
+                if s["modality"] == role and s["id"] in self.anchors["baselines"]]
+        return {f: S.median(r.get(f) for r in rows) for f in self.features[role]
+                if any(r.get(f) is not None for r in rows)}
+
+    def _flex(self, raw: Dict[str, dict], per_image: dict) -> dict:
+        """Prompt adherence vs step 0: mean SigLIP cosine change over flex
+        slots, x100 (points; negative = the prompts are followed less)."""
+        base = self.anchors["baselines"]
+        deltas = []
+        for s in self.flex_slots:
+            r = raw.get(s["id"], {"status": S.FAILED, "reason": "image missing", "raws": {}})
+            now = r.get("raws", {}).get("flex_siglip")
+            then = (base.get(s["id"]) or {}).get("flex_siglip")
+            d = None if now is None or then is None else 100.0 * (now - then)
+            per_image[s["id"]] = {"modality": "flex", "bin": s["bin"], "status": r["status"],
+                                  "reason": r.get("reason"), "raw": now, "baseline": then, "delta": d}
+            if d is not None:
+                deltas.append(d)
+        return {
+            "delta": sum(deltas) / len(deltas) if deltas else None,
+            "valid_slots": len(deltas),
+            "slots": len(self.flex_slots),
+        }
 
     def close(self):
         for w in self.workers.values():

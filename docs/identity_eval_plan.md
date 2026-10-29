@@ -157,6 +157,28 @@ view-binned prototypes (front / ¾ / profile) → LOO target per feature.
 v1 face score: `F = 0.6*F_CVL + 0.4*F_Arc` (`metric_version 1.0.0-face-v1`).
 Spec weights (adds MICA 25%, landmarks 10%) arrive in v2 as `2.0.0`.
 
+As built (`toolkit/identity_eval/worker/face.py`):
+
+- **Models**: SCRFD 10G and ArcFace R100 (`glintr100`) from the official
+  `antelopev2` pack (`~/.insightface/models/antelopev2`, downloaded from the
+  insightface v0.7 release when missing) on ONNX Runtime GPU 1.31 (CUDA 13);
+  CVLFace `adaface_vit_base_kprpe_webface12m` with the DFA mobilenet aligner
+  for its keypoints. The CVLFace repos are imported as plain modules and
+  loaded from safetensors; their transformers wrappers, torch pickles and
+  auto-compiled `rpe_ops` extension are not used (pure torch RPE path).
+- **Subject selection**: largest face; `NO_FACE` when none, when a second
+  face has ≥ 60% of its area, or when the face's short side is < 48 px.
+- **View**: yaw from the five SCRFD points (front < 20°, three_quarter < 55°,
+  else profile). Each feature's raw value is the cosine to the prototype of
+  references in the same view, or all references when that view has fewer
+  than 2. The LOO target uses the same rule. The all-view cosine is logged as
+  a cross-view diagnostic.
+- **Missing step-0 face**: a slot whose step-0 image is unscorable falls back
+  to the suite's median baseline per feature, flagged `baseline: pooled` with
+  a round warning, instead of staying `UNCALIBRATED` for the whole run.
+- Timing on the 5060 Ti: ~20 s model load at worker start, ~1 s to move to
+  the GPU, ~3 s to score a 6-face + 4-flex round.
+
 ## Body (v1, with SMPL-X)
 
 1. Person detect + mask; reject truncation / multi-person.
@@ -208,6 +230,11 @@ similarity vs the same slot at step 0, reported as `identity/flex` (delta,
 not 0–100). Checkpoint ranking requires F ≥ 70, B ≥ 70 and flex not below
 a configurable drop from baseline.
 
+As built: SigLIP2 `google/siglip2-base-patch16-384` in the face worker. The
+text is the suite prompt with `[trigger]` replaced by "a person". `identity/flex`
+is the mean cosine change ×100 over flex slots. A round warns when it is below
+`-flex_max_drop` (default 3).
+
 ## Config (YAML, `process[0].identity_eval`)
 
 ```yaml
@@ -240,10 +267,17 @@ identity_eval:
 
 ## Status
 
-P0 is implemented with a placeholder scorer (`metric_version 0.0.0-stub`,
-grayscale-thumbnail similarity) so the pipeline runs end to end. Still open
-from P0: the model-install spike (SAM 3D Body, SMPLest-X, CVLFace on Windows,
-CUDA 12.8+ for sm_120) and timing the unload/reload on a real run.
+P0 is implemented and has run on a real training job.
+
+P1 is implemented: face v1 (`1.0.0-face-v1`) and the flex guard run in the
+face worker. Body still uses the placeholder scorer (`0.0.0-stub`) until P2.
+`backend: stub` in `identity_eval` forces the placeholder for both workers.
+Evaluator dependencies beyond the toolkit's are listed in
+`toolkit/identity_eval/requirements.txt`. Verified end to end with the real
+models on photos and synthetic rounds; still to do: review cross-pose cases on
+a real training run (P1 exit criterion).
+
+Still open from P0: the SAM 3D Body / SMPLest-X install spike (P2).
 
 ## Phases
 
