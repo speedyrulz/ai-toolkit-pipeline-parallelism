@@ -29,6 +29,11 @@ function clamp01(x: number) {
 }
 
 // Fallback canvas height used before the container has been measured.
+// identity eval scores (toolkit/identity_eval) share one fixed 0-100 axis;
+// identity/flex is a delta and keeps its own axis like every other metric
+const IDENTITY_SCALE = 'y::identity';
+const IDENTITY_SCORES = new Set(['identity/face', 'identity/body', 'identity/overall']);
+
 const FALLBACK_CANVAS_HEIGHT = 360;
 const MIN_CANVAS_HEIGHT = 160;
 
@@ -290,12 +295,13 @@ export default function JobLossGraph({ job }: Props) {
 
     for (let ki = 0; ki < activeKeys.length; ki++) {
       const key = activeKeys[ki];
-      const scaleKey = `y::${key}`;
+      const identityScore = IDENTITY_SCORES.has(key);
+      const scaleKey = identityScore ? IDENTITY_SCALE : `y::${key}`;
       const pts: LossPoint[] = series[key] ?? [];
       const map = new Map<number, number>();
       for (const p of pts) {
         if (p.value === null || !Number.isFinite(p.value as number)) continue;
-        if (useLogScale && (p.value as number) <= 0) continue;
+        if (useLogScale && !identityScore && (p.value as number) <= 0) continue;
         if (!xsSet.has(p.step)) continue;
         map.set(p.step, p.value as number);
       }
@@ -339,6 +345,25 @@ export default function JobLossGraph({ job }: Props) {
           value: (_u, value) => formatNum(value),
         });
         colArrays.push(fullSmooth);
+      }
+
+      if (identityScore) {
+        // one shared scale and axis for all identity scores, never clipped
+        if (!scales[IDENTITY_SCALE]) {
+          scales[IDENTITY_SCALE] = { distr: 1, range: () => [0, 100] };
+          axes.push({
+            scale: IDENTITY_SCALE,
+            side: ki % 2 === 0 ? 3 : 1,
+            stroke: 'rgba(255,255,255,0.55)',
+            label: 'identity (0-100)',
+            labelSize: 14,
+            grid: { show: ki === 0, stroke: 'rgba(255,255,255,0.06)' },
+            ticks: { stroke: 'rgba(255,255,255,0.15)' },
+            size: 60,
+            values: (_u, ticks) => ticks.map(tk => formatNum(tk)),
+          });
+        }
+        continue;
       }
 
       scaleArrays[scaleKey] = colArrays;

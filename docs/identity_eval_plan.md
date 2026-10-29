@@ -87,6 +87,13 @@ training resumes; scores are logged against the round's step
 Rounds without identity eval (`eval_every` > 1) do steps 1 and 4 only, with
 no unload.
 
+As built (P3): when neither scoring worker is on the trainer's card (e.g.
+`face_gpu: 1, body_gpu: 1`), steps 2 to 4 are replaced by background
+scoring: only the sample helper leaves `cuda:1`, the workers load, score and
+unload there while training continues on `cuda:0`, and the next sample round
+first waits for that to finish and moves the helper back. A worker on the
+trainer's card keeps the sequence above.
+
 ### Sample helper (cuda:1)
 
 A separate process, started once per run, so both GPUs render truly in
@@ -204,7 +211,7 @@ v1 body score is `metric_version 1.0.0-body-v1` with the 40/30/30 weights.
 **Estimator agreement** (MHR vs SMPL-X shape, after conversion) feeds the
 LOW/MEDIUM/HIGH confidence tag, not the score.
 
-As built (`toolkit/identity_eval/worker/body.py`, `1.0.0-body-v1`):
+As built (`toolkit/identity_eval/worker/body.py`, `1.1.0-body-v1`):
 
 - **Code and weights**: `sam-3d-body`, `dinov3` and `SMPLest-X` are fetched at
   pinned commits into `~/.cache/identity_eval/repos`. Weights come from
@@ -218,18 +225,19 @@ As built (`toolkit/identity_eval/worker/body.py`, `1.0.0-body-v1`):
   numpy-only unpickler). VPoser is not used.
 - **Subject and QC**: torchvision Mask R-CNN person box; `NO_BODY` when none,
   when another person (not inside the main box) has ≥ 50% of its area, or when
-  the person is under 256 px tall; `BODY_CROPPED` when an ankle falls more than
-  5% below the frame.
+  the person is under 256 px tall; `BODY_CROPPED` when a knee is in the bottom
+  2% of the frame or below it, or a shoulder is above it (feet may be cropped).
 - **Reference body**: per-component median of the reference estimates (MHR
   shape + scale; SMPL-X betas). The multi-view SMPLify-X fit is not built.
-- **Features** (head excluded throughout; shapes scale-normalized, so they
-  measure build rather than estimated height):
+- **Features** (shoulders to knees only: torso, hips, thighs, upper arms and
+  forearms; the head, hands, shins and feet are never compared. Shapes are
+  scale-normalized, so they measure build rather than estimated height):
 
   | Feature | Weight |
   |---------|--------|
   | `body_shape_mhr`: pose-neutral MHR mesh distance | 30% |
   | `body_shape_smplx`: T-pose SMPL-X mesh distance | 30% |
-  | `body_proportions`: 10 SMPL-X measurements (shoulder width, torso, thigh, shin, upper arm, forearm, chest/waist/hip/thigh girth) over neck-to-ankle height | 40% |
+  | `body_proportions`: 9 SMPL-X measurements (shoulder width, torso, thigh, upper arm, forearm, chest/waist/hip/thigh girth) over neck-to-knee height | 40% |
 
   The reprojected silhouette was built and dropped: on the reference set it
   scored random bodies the same as the reference body (0.75 vs 0.755), while
@@ -308,11 +316,28 @@ P0 is implemented and has run on a real training job.
 P1 is implemented and has run on a real training job: face v1
 (`1.0.1-face-v1`) and the flex guard run in the face worker.
 
-P2 is implemented: body v1 (`1.0.0-body-v1`, see Body). Verified end to end
-with the real models (body scores rise as a widened body converges to the
-reference build). Only 6 of the 22 current body references are usable (the
-rest crop the feet or show several people). Still to do: review
-front/side/back comparisons on a real run (P2 exit criterion).
+P2 is implemented and has run on a real training job: body v1
+(`1.1.0-body-v1`, see Body). 1.0.0 needed the feet in frame, which left 6 of
+22 references usable and made cropped generations drop body coverage below
+the gate; 1.1.0 measures shoulders to knees only (10 of 22 usable, all four
+views).
+
+P3 is implemented:
+- **Checkpoint ranking**: `ranking.json` after every round
+  (`scoring.rank_rounds`). Eligible when identity is published, face ≥
+  `rank_min_face` (70), body ≥ `rank_min_body` (70) and flex ≥
+  `-flex_max_drop`; eligible rounds rank by identity. The end of training
+  logs the best step. The Identity tab shows the best checkpoint with its
+  file, or says no checkpoint was saved at that step.
+- **Identity tab**: rank and checkpoint columns, per-angle scores, per-slot
+  details (raw / step 0 / target per feature, the slot's images across all
+  rounds), and the reference set with excluded files and reasons.
+- **Loss graph**: `identity/face`, `body` and `overall` share one fixed
+  0–100 axis; `identity/flex` keeps its own.
+- **Background scoring** (see Two-GPU execution): the trainer no longer
+  pauses for scoring when both workers are on the second card. Real-model
+  test: 12 s rounds scored beside training.
+Still to do: a full training run with these changes (P3 exit criterion).
 
 `backend: stub` in `identity_eval` forces the placeholder for both workers.
 Evaluator dependencies beyond the toolkit's are listed in

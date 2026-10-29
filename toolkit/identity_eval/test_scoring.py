@@ -105,6 +105,22 @@ class TestTargetAndAggregate(unittest.TestCase):
         agg = S.aggregate(slots, expected_slots=3)
         self.assertEqual(agg['score'], 0.0)
 
+    def test_rank_rounds_gates_and_order(self):
+        def rnd(step, face, body, flex):
+            ident = S.fuse(face, body)
+            return {'step': step, 'face': {'score': face}, 'body': {'score': body},
+                    'identity': {'score': ident}, 'flex': {'delta': flex}}
+        rows = S.rank_rounds([
+            rnd(100, 60.0, 90.0, 0.0),    # face gate
+            rnd(200, 80.0, 75.0, -1.0),   # eligible
+            rnd(300, 95.0, 95.0, -6.0),   # flex gate, highest identity
+            rnd(400, 85.0, 85.0, None),   # eligible, no flex reading
+            rnd(500, 90.0, None, 0.0),    # body missing
+        ])
+        self.assertEqual([r['step'] for r in rows], [400, 200, 300, 100, 500])
+        self.assertEqual([r['eligible'] for r in rows], [True, True, False, False, False])
+        self.assertEqual(rows[2]['reasons'], ['flex below -3'])
+        self.assertIn('identity N/A', rows[4]['reasons'])
 
 if __name__ == '__main__':
     unittest.main()

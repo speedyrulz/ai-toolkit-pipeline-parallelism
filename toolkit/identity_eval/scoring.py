@@ -143,3 +143,35 @@ def score_slot(
     combined = weighted_score({k: v['score'] for k, v in features.items()}, weights)
     max_ratio = max((v['ratio'] for v in features.values() if v['ratio'] is not None), default=None)
     return {'score': combined, 'features': features, 'max_ratio': max_ratio}
+
+
+def rank_rounds(rounds: List[dict], min_face: float = 70.0, min_body: float = 70.0,
+                flex_max_drop: float = 3.0) -> List[dict]:
+    """Checkpoint ranking (plan "Flexibility guard"): a round is eligible when
+    identity is published, face >= min_face, body >= min_body and prompt
+    adherence is not more than flex_max_drop below step 0 (a round without a
+    flex reading is not held back by it). Eligible rounds first, each group by
+    identity, best first; rounds without identity last.
+
+    rounds: checkpoint summaries ({'step', 'face', 'body', 'identity', 'flex'}).
+    """
+    rows = []
+    for r in rounds:
+        face = (r.get('face') or {}).get('score')
+        body = (r.get('body') or {}).get('score')
+        identity = (r.get('identity') or {}).get('score')
+        flex = (r.get('flex') or {}).get('delta')
+        reasons = []
+        if identity is None:
+            reasons.append('identity N/A')
+        if face is None or face < min_face:
+            reasons.append(f'face below {min_face:g}')
+        if body is None or body < min_body:
+            reasons.append(f'body below {min_body:g}')
+        if flex is not None and flex < -flex_max_drop:
+            reasons.append(f'flex below -{flex_max_drop:g}')
+        rows.append({'step': r['step'], 'identity': identity, 'face': face, 'body': body, 'flex': flex,
+                     'over_target_slots': r.get('over_target_slots', 0), 'eligible': not reasons,
+                     'reasons': reasons})
+    rows.sort(key=lambda x: (not x['eligible'], x['identity'] is None, -(x['identity'] or 0.0), x['step']))
+    return rows

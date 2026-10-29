@@ -176,6 +176,10 @@ class IdentityEvalConfig:
         # flex guard: warn when prompt adherence (SigLIP, x100) drops more than
         # this many points below step 0
         self.flex_max_drop: float = float(kwargs.get('flex_max_drop', 3.0))
+        # checkpoint ranking: a round's checkpoint is eligible when face and
+        # body reach these scores and flex is within flex_max_drop
+        self.rank_min_face: float = float(kwargs.get('rank_min_face', 70.0))
+        self.rank_min_body: float = float(kwargs.get('rank_min_body', 70.0))
         # scoring backend: 'auto' = real models where available, 'stub' = placeholder
         self.backend: str = kwargs.get('backend', 'auto') or 'auto'
         # model overrides for the face worker (identity_eval/worker/face.py

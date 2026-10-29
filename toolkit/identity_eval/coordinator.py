@@ -58,6 +58,8 @@ class IdentityEval:
         body_gpu = cfg.body_gpu if cfg.body_gpu is not None else (
             second_gpu if second_gpu is not None else trainer_gpu)
         self.gpus = {"face": face_gpu, "body": body_gpu}
+        self.trainer_gpu = trainer_gpu
+        self.second_gpu = second_gpu
         self.references = {
             "face": cfg.face_references or default_references,
             "body": cfg.body_references or default_references,
@@ -70,8 +72,9 @@ class IdentityEval:
         self.anchors: Optional[dict] = None
         self.calibration_id: Optional[str] = None
         self.active = False
-        self._pending: List[dict] = []   # async (cpu) rounds in flight
+        self._pending: List[dict] = []   # rounds scoring beside training
         self._ready_metrics: List[dict] = []
+        self._helper_offloaded = None    # the sample helper, while background scoring holds its card
 
     # ------------------------------------------------------------------
     # setup
@@ -79,6 +82,12 @@ class IdentityEval:
     @property
     def uses_gpu(self) -> bool:
         return any(g is not None and g >= 0 for g in self.gpus.values())
+
+    @property
+    def background(self) -> bool:
+        """Rounds score beside training when no scoring worker shares the
+        trainer's card (cpu workers, or gpu workers on the second card)."""
+        return all(g is None or g < 0 or g != self.trainer_gpu for g in self.gpus.values())
 
     def _worker_models(self, role: str) -> dict:
         models = dict(self.cfg.models)
@@ -323,14 +332,18 @@ class IdentityEval:
     def _collect(reply: dict) -> Dict[str, dict]:
         return {res["slot"]: res for res in reply["results"]}
 
-    def score_round(self, step: int, gpu_session):
-        """Score a rendered round. Gpu workers score now while the trainer is
-        unloaded; cpu workers score beside training and are picked up by poll()."""
+    def score_round(self, step: int, gpu_session, helper=None):
+        """Score a rendered round. When a worker shares the trainer's card it
+        scores now while the trainer is unloaded; otherwise the round scores
+        beside training (on cpu or the second card, with the sample helper
+        moved off that card until the next sample round) and poll() picks it up."""
         folder = self.step_dir(step)
         with open(os.path.join(folder, "DONE"), "w") as f:
             f.write(time.strftime("%Y-%m-%d %H:%M:%S"))
         images = self._image_list(folder)
-        if self.uses_gpu:
+        if self.background:
+            self._score_background(step, images, helper)
+        elif self.uses_gpu:
             print_acc(f"Identity eval: scoring step {step}")
             t0 = time.time()
             try:
@@ -340,12 +353,30 @@ class IdentityEval:
                 print_acc(f"Identity eval: scoring failed for step {step}: {e}")
                 return
             self._ready_metrics.append(self._finish_round(step, raw, time.time() - t0))
-        else:
-            ids = {r: self.workers[r].send("score", images=images[r]) for r in ROLES}
-            self._pending.append({"step": step, "ids": ids, "t0": time.time(), "results": {}})
 
-    def poll(self) -> List[dict]:
-        """Finished rounds as [{'step', 'metrics'}], oldest first."""
+    def _score_background(self, step: int, images: Dict[str, List[dict]], helper):
+        gpu_roles = [r for r in ROLES if self.gpus[r] is not None and self.gpus[r] >= 0]
+        if (gpu_roles and helper is not None and self.second_gpu is not None
+                and any(self.gpus[r] == self.second_gpu for r in gpu_roles)):
+            helper.offload()
+            self._helper_offloaded = helper
+        try:
+            ids, tail = {}, {}
+            for r in ROLES:
+                # each worker answers in order: load, score, unload
+                if r in gpu_roles:
+                    self.workers[r].send("to_gpu")
+                ids[r] = self.workers[r].send("score", images=images[r])
+                if r in gpu_roles:
+                    tail[r] = self.workers[r].send("to_cpu")
+        except ChildError as e:
+            print_acc(f"Identity eval: scoring failed for step {step}: {e}")
+            return
+        where = f"gpu {self.second_gpu}" if gpu_roles else "cpu"
+        print_acc(f"Identity eval: scoring step {step} on {where} beside training")
+        self._pending.append({"step": step, "ids": ids, "tail": tail, "t0": time.time(), "results": {}})
+
+    def _advance(self):
         still = []
         for p in self._pending:
             try:
@@ -354,26 +385,56 @@ class IdentityEval:
                     if reply is not None:
                         p["results"].update(self._collect(reply))
                         del p["ids"][r]
+                for r, req in list(p.get("tail", {}).items()):
+                    if self.workers[r].poll(req) is not None:
+                        del p["tail"][r]
             except ChildError as e:
                 print_acc(f"Identity eval: scoring failed for step {p['step']}: {e}")
                 continue
-            if p["ids"]:
+            if p["ids"] or p.get("tail"):
                 still.append(p)
             else:
                 self._ready_metrics.append(self._finish_round(p["step"], p["results"], time.time() - p["t0"]))
         self._pending = still
+
+    def poll(self) -> List[dict]:
+        """Finished rounds as [{'step', 'metrics'}], oldest first."""
+        self._advance()
         out, self._ready_metrics = self._ready_metrics, []
         return [m for m in out if m is not None]
+
+    def drain(self, timeout_s: float = 1800.0):
+        """Before a sample round: wait for background scoring to release the
+        second card, then give it back to the sample helper. Finished rounds
+        stay queued for the next poll()."""
+        deadline = time.time() + timeout_s
+        if self._pending:
+            print_acc("Identity eval: waiting for background scoring to finish")
+        while self._pending and time.time() < deadline:
+            self._advance()
+            if self._pending:
+                time.sleep(0.5)
+        if self._helper_offloaded is not None:
+            self._helper_offloaded.onload()
+            self._helper_offloaded = None
 
     def finish(self, timeout_s: float) -> List[dict]:
         deadline = time.time() + timeout_s
         done = self.poll()
         while self._pending and time.time() < deadline:
-            time.sleep(2.0)
+            time.sleep(1.0)
             done.extend(self.poll())
         if self._pending:
             print_acc("Identity eval did not finish scoring step(s) "
                       + ", ".join(str(p["step"]) for p in self._pending))
+        rows = self._write_ranking()
+        if rows and rows[0]["eligible"]:
+            print_acc(f"Identity eval: best checkpoint step {rows[0]['step']} "
+                      f"(identity {rows[0]['identity']:.1f})")
+        elif rows:
+            print_acc("Identity eval: no round met the checkpoint ranking gates "
+                      f"(face >= {self.cfg.rank_min_face:g}, body >= {self.cfg.rank_min_body:g}, "
+                      f"flex >= -{self.cfg.flex_max_drop:g})")
         return done
 
     def _finish_round(self, step: int, raw: Dict[str, dict], seconds: float) -> Optional[dict]:
@@ -446,6 +507,7 @@ class IdentityEval:
         M.write_json(os.path.join(folder, "checkpoint_summary.json"), summary)
         with open(os.path.join(self.root, "results.jsonl"), "a", encoding="utf-8") as f:
             f.write(json.dumps(summary) + "\n")
+        self._write_ranking()
 
         def fmt(v):
             return "N/A" if v is None else f"{v:.1f}"
@@ -465,6 +527,27 @@ class IdentityEval:
         if flex["delta"] is not None:
             metrics["identity/flex"] = flex["delta"]
         return {"step": step, "metrics": metrics}
+
+    def _write_ranking(self) -> List[dict]:
+        """ranking.json: every scored round ranked for checkpoint selection
+        (the UI joins it with the checkpoint files on disk)."""
+        by_step = {}
+        try:
+            with open(os.path.join(self.root, "results.jsonl"), encoding="utf-8") as f:
+                for line in f:
+                    if line.strip():
+                        r = json.loads(line)
+                        by_step[r["step"]] = r  # a resumed run may rescore a step
+        except (OSError, ValueError):
+            pass
+        c = self.cfg
+        rows = S.rank_rounds(list(by_step.values()), c.rank_min_face, c.rank_min_body, c.flex_max_drop)
+        M.write_json(os.path.join(self.root, "ranking.json"), {
+            "criteria": {"min_face": c.rank_min_face, "min_body": c.rank_min_body,
+                         "flex_max_drop": c.flex_max_drop},
+            "rows": rows,
+        })
+        return rows
 
     @staticmethod
     def _agreement(features: dict) -> Optional[str]:

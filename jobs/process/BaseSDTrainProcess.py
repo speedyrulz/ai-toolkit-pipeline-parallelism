@@ -298,6 +298,9 @@ class BaseSDTrainProcess(BaseTrainProcess):
     def sample(self, step=None, is_first=False, final=False):
         if not self.accelerator.is_main_process:
             return
+        if self.identity_eval is not None:
+            # background scoring holds the second card until it finishes
+            self.identity_eval.drain()
         flush()
         sample_folder = os.path.join(self.save_root, 'samples')
         gen_img_config_list = []
@@ -417,7 +420,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
             self.ema.train()
 
         if identity_round:
-            self.identity_eval.score_round(step, self._gpu_session)
+            self.identity_eval.score_round(step, self._gpu_session, helper=self.sample_helper)
         print_acc("") # add a line break
 
     # ------------------------------------------------------------------

@@ -6,7 +6,9 @@ import { getTrainingFolder } from '@/server/settings';
 
 // Identity eval results for a job (toolkit/identity_eval writes them under
 // <training folder>/<job>/identity_eval). ?step=N picks the round whose images
-// and per-image scores are returned; default is the latest scored round.
+// and per-image scores are returned; default is the latest scored round. The
+// checkpoint ranking (ranking.json) is joined with the checkpoint files still
+// on disk: <job>_<step 9 digits>.safetensors, or <job>.safetensors for the end.
 
 async function readJson(p: string): Promise<any> {
   try {
@@ -28,6 +30,20 @@ function slotImages(folder: string): Record<string, string> {
   return out;
 }
 
+// step -> checkpoint path; the unnumbered final save is returned as step -1
+function checkpoints(jobFolder: string, jobName: string): Map<number, string> {
+  const out = new Map<number, string>();
+  if (!fs.existsSync(jobFolder)) return out;
+  for (const f of fs.readdirSync(jobFolder)) {
+    if (!f.startsWith(jobName) || !f.endsWith('.safetensors')) continue;
+    const rest = f.slice(jobName.length, -'.safetensors'.length);
+    const m = rest.match(/^_(\d{9})$/);
+    if (m) out.set(parseInt(m[1]), path.join(jobFolder, f));
+    else if (rest === '') out.set(-1, path.join(jobFolder, f));
+  }
+  return out;
+}
+
 export async function GET(request: NextRequest, { params }: { params: { jobID: string } }) {
   const { jobID } = await params;
   const job = await prisma.job.findUnique({ where: { id: jobID } });
@@ -35,7 +51,8 @@ export async function GET(request: NextRequest, { params }: { params: { jobID: s
     return NextResponse.json({ error: 'Job not found' }, { status: 404 });
   }
 
-  const root = path.join(await getTrainingFolder(), job.name, 'identity_eval');
+  const jobFolder = path.join(await getTrainingFolder(), job.name);
+  const root = path.join(jobFolder, 'identity_eval');
   const manifest = await readJson(path.join(root, 'manifest.json'));
   if (!manifest) {
     return NextResponse.json({ exists: false });
@@ -68,6 +85,25 @@ export async function GET(request: NextRequest, { params }: { params: { jobID: s
     };
   }
 
+  // ranking rows with the checkpoint saved at that step; the final save
+  // belongs to the last scored round when no numbered file has that step
+  const ranking = await readJson(path.join(root, 'ranking.json'));
+  if (ranking?.rows) {
+    const ckpts = checkpoints(jobFolder, job.name);
+    const lastStep = rounds.length ? rounds[rounds.length - 1].step : null;
+    for (const row of ranking.rows) {
+      row.checkpoint = ckpts.get(row.step) ?? (row.step === lastStep ? ckpts.get(-1) : undefined) ?? null;
+    }
+  }
+
+  // every round's images, for the per-slot history strip
+  const stepImages: Record<number, Record<string, string>> = {};
+  for (const r of rounds) {
+    stepImages[r.step] = slotImages(path.join(root, `step_${String(r.step).padStart(9, '0')}`));
+  }
+
+  const anchors = await readJson(path.join(root, 'anchors.json'));
+
   return NextResponse.json(
     {
       exists: true,
@@ -79,6 +115,17 @@ export async function GET(request: NextRequest, { params }: { params: { jobID: s
       rounds,
       selected,
       baseline_images: slotImages(path.join(root, 'baseline')),
+      step_images: stepImages,
+      ranking,
+      anchors: anchors
+        ? {
+            targets: anchors.targets,
+            baselines: anchors.baselines,
+            reference_counts: anchors.reference_counts,
+            reference_views: anchors.reference_views,
+            excluded_references: anchors.excluded_references,
+          }
+        : null,
     },
     { headers: { 'Cache-Control': 'no-store' } },
   );
