@@ -43,3 +43,6 @@ av==16.0.1
 torchcodec==0.15.0
 librosa==0.11.0
 mutagen==1.47.0
+# identity eval face worker (toolkit/identity_eval/requirements.txt)
+onnxruntime-gpu>=1.31; sys_platform != "darwin"
+easydict
