@@ -1736,6 +1736,17 @@ export default function SimpleJob({
                         { value: 'lcm', label: 'LCM' },
                       ]}
                     />
+                    <SelectInput
+                      label="Scheduler"
+                      className="pt-2"
+                      value={jobConfig.config.process[0].sample.scheduler ?? 'default'}
+                      onChange={value => setJobConfig(value, 'config.process[0].sample.scheduler')}
+                      options={[
+                        { value: 'default', label: 'Default' },
+                        { value: 'karras', label: 'Karras' },
+                        { value: 'exponential', label: 'Exponential' },
+                      ]}
+                    />
                     <NumberInput
                       label="Guidance Scale"
                       value={jobConfig.config.process[0].sample.guidance_scale}

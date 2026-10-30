@@ -35,7 +35,7 @@ from toolkit.unloader import FakeTextEncoder
 from toolkit.paths import KEYMAPS_ROOT
 from toolkit.prompt_utils import inject_trigger_into_prompt, PromptEmbeds, concat_prompt_embeds
 from toolkit.reference_adapter import ReferenceAdapter
-from toolkit.sampler import get_sampler
+from toolkit.sampler import get_sampler, swap_sigma_schedule
 from toolkit.samplers.custom_flowmatch_sampler import CustomFlowMatchEulerDiscreteScheduler
 from toolkit.saving import save_ldm_model_from_diffusers, get_ldm_state_dict_from_diffusers
 from toolkit.sd_device_states_presets import empty_preset
@@ -1265,6 +1265,7 @@ class StableDiffusion:
             image_configs: List[GenerateImageConfig],
             sampler=None,
             pipeline: Union[None, StableDiffusionPipeline, StableDiffusionXLPipeline] = None,
+            scheduler=None,
     ):
         network = unwrap_model(self.network)
         merge_multiplier = 1.0
@@ -1473,6 +1474,8 @@ class StableDiffusion:
 
         from toolkit.sample_step_hook import install_sample_step_hooks
 
+        # karras / exponential sigma spacing for this round only
+        restore_scheduler = swap_sigma_schedule(pipeline, scheduler)
         unwrap_step_hooks = install_sample_step_hooks(self, pipeline)
 
         refiner_pipeline = None
@@ -1852,6 +1855,7 @@ class StableDiffusion:
                     self.adapter.clear_memory()
 
         unwrap_step_hooks()
+        restore_scheduler()
         # clear pipeline and cache to reduce vram usage
         del pipeline
         if refiner_pipeline is not None:

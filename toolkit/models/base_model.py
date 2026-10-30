@@ -17,6 +17,7 @@ from tqdm import tqdm
 from torchvision.transforms import Resize, transforms
 
 from toolkit.clip_vision_adapter import ClipVisionAdapter
+from toolkit.sampler import swap_sigma_schedule
 from toolkit.custom_adapter import CustomAdapter
 from toolkit.ip_adapter import IPAdapter
 from toolkit.config_modules import ModelConfig, GenerateImageConfig, ModelArch
@@ -459,6 +460,7 @@ class BaseModel:
             sampler=None,
             pipeline: Union[None, StableDiffusionPipeline,
                             StableDiffusionXLPipeline] = None,
+            scheduler=None,
     ):
         network = self.network
         merge_multiplier = 1.0
@@ -508,6 +510,8 @@ class BaseModel:
             except:
                 pass
 
+        # karras / exponential sigma spacing for this round only
+        restore_scheduler = swap_sigma_schedule(pipeline, scheduler)
         unwrap_step_hooks = self._install_sample_step_hooks(pipeline)
 
         start_multiplier = 1.0
@@ -788,6 +792,7 @@ class BaseModel:
                     self.adapter.clear_memory()
 
         unwrap_step_hooks()
+        restore_scheduler()
         # clear pipeline and cache to reduce vram usage
         del pipeline
         torch.cuda.empty_cache()

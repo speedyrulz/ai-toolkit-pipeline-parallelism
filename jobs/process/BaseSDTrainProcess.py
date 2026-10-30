@@ -387,7 +387,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
         sample_loras = self._attach_sample_loras(sample_config)
         try:
             # send to be generated
-            self.sd.generate_images(gen_img_config_list, sampler=sample_config.sampler)
+            self.sd.generate_images(gen_img_config_list, sampler=sample_config.sampler, scheduler=sample_config.scheduler)
 
             if likeness_on:
                 self._likeness_sample_round(step, sample_config, sample_folder, files_before)
@@ -505,7 +505,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
             if regular_cache is not None:
                 self.sd.sample_prompts_cache = getattr(self.sd, 'likeness_prompts_cache', None)
             try:
-                self.sd.generate_images(configs, sampler=sample_config.sampler)
+                self.sd.generate_images(configs, sampler=sample_config.sampler, scheduler=sample_config.scheduler)
             finally:
                 self.sd.sample_prompts_cache = regular_cache
         else:
