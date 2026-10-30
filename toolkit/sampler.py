@@ -183,3 +183,39 @@ def get_sampler(
     scheduler = scheduler_cls.from_config(config)
 
     return scheduler
+
+
+SIGMA_SCHEDULES = {
+    "karras": "use_karras_sigmas",
+    "exponential": "use_exponential_sigmas",
+}
+
+
+def swap_sigma_schedule(pipeline, schedule):
+    """Give the pipeline a copy of its scheduler that spaces sigmas on the
+    karras or exponential schedule. Returns a function that puts the original
+    scheduler back. No-op for 'default' or schedulers without the option."""
+    schedule = (schedule or "default").lower()
+    scheduler = getattr(pipeline, "scheduler", None)
+    if schedule == "default" or scheduler is None:
+        return lambda: None
+    if schedule not in SIGMA_SCHEDULES:
+        raise ValueError(f"Sample scheduler {schedule} not supported, use default, karras or exponential")
+    flag = SIGMA_SCHEDULES[schedule]
+    if flag not in scheduler.config:
+        print(f"Sample scheduler {schedule} is not supported by {type(scheduler).__name__}, using its default sigmas")
+        return lambda: None
+    overrides = {name: False for name in ("use_karras_sigmas", "use_exponential_sigmas", "use_beta_sigmas")
+                 if name in scheduler.config}
+    overrides[flag] = True
+    # a copy so the training noise scheduler is never touched. from_config is
+    # avoided as CustomFlowMatchEulerDiscreteScheduler marks every key as a
+    # default there and would lose its shift settings
+    sampling_scheduler = copy.deepcopy(scheduler)
+    sampling_scheduler.register_to_config(**overrides)
+    pipeline.scheduler = sampling_scheduler
+
+    def restore():
+        pipeline.scheduler = scheduler
+
+    return restore

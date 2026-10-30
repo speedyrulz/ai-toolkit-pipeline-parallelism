@@ -128,6 +128,10 @@ class LikenessConfig:
 class SampleConfig:
     def __init__(self, **kwargs):
         self.sampler: str = kwargs.get('sampler', 'ddpm')
+        # sigma spacing for samples and likeness scoring prompts: default, karras, exponential
+        self.scheduler: str = (kwargs.get('scheduler') or 'default').lower()
+        if self.scheduler not in ('default', 'karras', 'exponential'):
+            raise ValueError("sample.scheduler must be 'default', 'karras' or 'exponential'")
         self.sample_every: int = kwargs.get('sample_every', 100)
         self.sample_start_step: int = kwargs.get('sample_start_step', 0)
         self.width: int = kwargs.get('width', 512)

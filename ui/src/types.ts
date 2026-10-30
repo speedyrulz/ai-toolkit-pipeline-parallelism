@@ -256,6 +256,8 @@ export interface SampleItem {
 
 export interface SampleConfig {
   sampler: string;
+  // sigma spacing for samples and likeness scoring prompts
+  scheduler?: 'default' | 'karras' | 'exponential';
   sample_every: number;
   sample_start_step: number;
   width: number;
