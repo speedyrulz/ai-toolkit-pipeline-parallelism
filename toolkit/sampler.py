@@ -1,6 +1,8 @@
 import copy
 import math
 
+import numpy as np
+from diffusers.utils import logging as diffusers_logging
 from diffusers import (
     DDPMScheduler,
     EulerAncestralDiscreteScheduler,
@@ -191,6 +193,53 @@ SIGMA_SCHEDULES = {
 }
 
 
+def lcm_sigma_schedule_timesteps(scheduler, num_inference_steps, schedule):
+    """Timesteps for an LCMScheduler that follow ComfyUI's karras or
+    exponential sigmas. ComfyUI spaces sigmas between the model's sigma_min
+    and sigma_max, appends a 0 and has its LCM sampler denoise at each sigma
+    then re-noise to the next one, which is what LCMScheduler.step does
+    between timesteps. Each sigma maps to the training timestep nearest in
+    log sigma, as ComfyUI's discrete model sampling does."""
+    alphas_cumprod = scheduler.alphas_cumprod.double().cpu().numpy()
+    log_sigmas = np.log(((1 - alphas_cumprod) / alphas_cumprod) ** 0.5)
+    sigma_min, sigma_max = math.exp(log_sigmas[0]), math.exp(log_sigmas[-1])
+    if schedule == "exponential":
+        sigmas = np.exp(np.linspace(math.log(sigma_max), math.log(sigma_min), num_inference_steps))
+    else:
+        rho = 7.0
+        ramp = np.linspace(0, 1, num_inference_steps)
+        min_inv_rho, max_inv_rho = sigma_min ** (1 / rho), sigma_max ** (1 / rho)
+        sigmas = (max_inv_rho + ramp * (min_inv_rho - max_inv_rho)) ** rho
+    timesteps = np.abs(np.log(sigmas)[:, None] - log_sigmas[None, :]).argmin(axis=1)
+    # LCMScheduler needs strictly descending timesteps; only long schedules
+    # can land two sigmas on the same timestep near sigma_min
+    timesteps = np.unique(timesteps)[::-1]
+    return [int(t) for t in timesteps]
+
+
+def _use_lcm_sigma_schedule(scheduler, schedule):
+    """Make this LCMScheduler instance build karras or exponential timesteps
+    whenever a pipeline asks it for num_inference_steps."""
+    original_set_timesteps = scheduler.set_timesteps
+
+    def set_timesteps(num_inference_steps=None, device=None, original_inference_steps=None,
+                      timesteps=None, strength=1.0):
+        if timesteps is not None or num_inference_steps is None:
+            return original_set_timesteps(num_inference_steps, device, original_inference_steps, timesteps, strength)
+        timesteps = lcm_sigma_schedule_timesteps(scheduler, num_inference_steps, schedule)
+        # diffusers warns that custom timesteps are off the distillation
+        # schedule, which is the point here
+        lcm_logger = diffusers_logging.get_logger("diffusers.schedulers.scheduling_lcm")
+        level = lcm_logger.level
+        lcm_logger.setLevel(diffusers_logging.ERROR)
+        try:
+            original_set_timesteps(None, device, original_inference_steps, timesteps, strength)
+        finally:
+            lcm_logger.setLevel(level)
+
+    scheduler.set_timesteps = set_timesteps
+
+
 def swap_sigma_schedule(pipeline, schedule):
     """Give the pipeline a copy of its scheduler that spaces sigmas on the
     karras or exponential schedule. Returns a function that puts the original
@@ -202,6 +251,15 @@ def swap_sigma_schedule(pipeline, schedule):
     if schedule not in SIGMA_SCHEDULES:
         raise ValueError(f"Sample scheduler {schedule} not supported, use default, karras or exponential")
     flag = SIGMA_SCHEDULES[schedule]
+    if isinstance(scheduler, LCMScheduler):
+        sampling_scheduler = copy.deepcopy(scheduler)
+        _use_lcm_sigma_schedule(sampling_scheduler, schedule)
+        pipeline.scheduler = sampling_scheduler
+
+        def restore():
+            pipeline.scheduler = scheduler
+
+        return restore
     if flag not in scheduler.config:
         print(f"Sample scheduler {schedule} is not supported by {type(scheduler).__name__}, using its default sigmas")
         return lambda: None
