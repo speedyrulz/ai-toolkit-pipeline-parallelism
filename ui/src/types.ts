@@ -176,6 +176,9 @@ export interface TrainConfig {
   noise_scheduler: string;
   timestep_type: string;
   content_or_style: string;
+  logit_mean?: number;
+  logit_std?: number;
+  sigmoid_scale?: number;
   optimizer: string;
   lr: number;
   ema_config?: EMAConfig;

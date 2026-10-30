@@ -907,8 +907,39 @@ export default function SimpleJob({
                       { value: 'balanced', label: 'Balanced' },
                       { value: 'content', label: 'High Noise' },
                       { value: 'style', label: 'Low Noise' },
+                      { value: 'logit_norm', label: 'Logit Normal' },
+                      { value: 'sigmoid', label: 'Sigmoid' },
                     ]}
                   />
+                  {jobConfig.config.process[0].train.content_or_style === 'logit_norm' && (
+                    <div className="flex gap-2 pt-2">
+                      <NumberInput
+                        label="Logit Mean"
+                        className="flex-1"
+                        value={jobConfig.config.process[0].train.logit_mean ?? 0}
+                        onChange={value => setJobConfig(value, 'config.process[0].train.logit_mean')}
+                        placeholder="eg. 0"
+                      />
+                      <NumberInput
+                        label="Logit Std"
+                        className="flex-1"
+                        value={jobConfig.config.process[0].train.logit_std ?? 1}
+                        onChange={value => setJobConfig(value, 'config.process[0].train.logit_std')}
+                        placeholder="eg. 1"
+                        min={0.01}
+                      />
+                    </div>
+                  )}
+                  {jobConfig.config.process[0].train.content_or_style === 'sigmoid' && (
+                    <NumberInput
+                      label="Sigmoid Scale"
+                      className="pt-2"
+                      value={jobConfig.config.process[0].train.sigmoid_scale ?? 1}
+                      onChange={value => setJobConfig(value, 'config.process[0].train.sigmoid_scale')}
+                      placeholder="eg. 1"
+                      min={0.01}
+                    />
+                  )}
                   <SelectInput
                     label="Loss Type"
                     className="pt-2"

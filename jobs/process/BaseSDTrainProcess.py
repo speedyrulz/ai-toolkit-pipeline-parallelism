@@ -1592,6 +1592,25 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     timestep_indices = timestep_indices.long()
                 elif self.train_config.timestep_type == 'one_step':
                     timestep_indices = torch.zeros((batch_size,), device=self.device_torch, dtype=torch.long)
+                elif content_or_style in ['logit_norm', 'sigmoid']:
+                    # bell curve centered on mid noise (SD3 / kohya style). t is the noise
+                    # level in 0-1; index 0 is full noise, so flip it into an index
+                    normal = torch.randn((batch_size,), device=self.device_torch)
+                    if content_or_style == 'logit_norm':
+                        t = torch.sigmoid(normal * self.train_config.logit_std + self.train_config.logit_mean)
+                    else:
+                        t = torch.sigmoid(normal * self.train_config.sigmoid_scale)
+                    timestep_indices = value_map(
+                        (1 - t) * (self.train_config.num_train_timesteps - 1),
+                        0,
+                        self.train_config.num_train_timesteps - 1,
+                        min_noise_steps,
+                        max_noise_steps
+                    )
+                    timestep_indices = timestep_indices.round().long().clamp(
+                        min_noise_steps,
+                        max_noise_steps
+                    )
                 elif content_or_style in ['style', 'content']:
                     # this is from diffusers training code
                     # Cubic sampling for favoring later or earlier timesteps

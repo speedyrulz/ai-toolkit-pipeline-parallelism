@@ -481,7 +481,7 @@ class DecoratorConfig:
         self.num_tokens: str = kwargs.get('num_tokens', 4)
 
 
-ContentOrStyleType = Literal['balanced', 'style', 'content']
+ContentOrStyleType = Literal['balanced', 'style', 'content', 'logit_norm', 'sigmoid']
 LossTarget = Literal['noise', 'source', 'unaugmented', 'differential_noise']
 
 
@@ -490,6 +490,13 @@ class TrainConfig:
         self.noise_scheduler = kwargs.get('noise_scheduler', 'ddpm')
         self.content_or_style: ContentOrStyleType = kwargs.get('content_or_style', 'balanced')
         self.content_or_style_reg: ContentOrStyleType = kwargs.get('content_or_style', 'balanced')
+        # logit_norm timestep bias: noise level = sigmoid(N(logit_mean, logit_std)).
+        # positive mean favors high noise, negative favors low noise
+        self.logit_mean: float = float(kwargs.get('logit_mean', 0.0))
+        self.logit_std: float = float(kwargs.get('logit_std', 1.0))
+        # sigmoid timestep bias: noise level = sigmoid(sigmoid_scale * N(0, 1)).
+        # higher scale spreads toward both ends, lower scale packs into the middle
+        self.sigmoid_scale: float = float(kwargs.get('sigmoid_scale', 1.0))
         self.steps: int = kwargs.get('steps', 1000)
         self.lr = kwargs.get('lr', 1e-6)
         self.unet_lr = kwargs.get('unet_lr', self.lr)
