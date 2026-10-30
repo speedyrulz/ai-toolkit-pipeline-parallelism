@@ -484,7 +484,8 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 finally:
                     self.network.multiplier = prev_multiplier
             strip = [{k: v for k, v in i.items() if not k.startswith('_')} for i in helper_items]
-            self.sample_helper.render_async(strip, lora_path, sample_config.sampler, sample_config.loras)
+            self.sample_helper.render_async(strip, lora_path, sample_config.sampler, sample_config.loras,
+                                            scheduler=sample_config.scheduler)
 
         try:
             if main_items:
@@ -501,7 +502,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     # generate_images reads cached embeddings by list index
                     self.sd.sample_prompts_cache = [self._cached_embeds(i['_cache_key'], regular_cache) for i in main_items]
                 try:
-                    self.sd.generate_images(configs, sampler=sample_config.sampler)
+                    self.sd.generate_images(configs, sampler=sample_config.sampler, scheduler=sample_config.scheduler)
                 finally:
                     if swap:
                         self.sd.sample_prompts_cache = regular_cache

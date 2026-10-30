@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import { Plus, X } from 'lucide-react';
 import LoraBrowserModal, { LoraPick } from '@/components/generate/LoraBrowserModal';
+import { ModelBrowseButton, standaloneBrowseClass } from '@/components/ModelBrowserModal';
 import {
   Checkbox,
   CreatableSelectInput,
@@ -87,6 +88,13 @@ const CaptionSimpleJob: React.FC<Props> = ({ jobConfig, setJobConfig, gpuIDs, se
           placeholder=""
           options={selectedCaptionOption?.name_or_path_options || []}
           required
+          suffix={
+            <ModelBrowseButton
+              value={jobConfig.config.process[0].caption.model_name_or_path}
+              onPick={p => setJobConfig(p, 'config.process[0].caption.model_name_or_path')}
+              className={standaloneBrowseClass}
+            />
+          }
         />
       </div>
       {additionalSections.includes('caption.model_name_or_path2') && (
@@ -102,6 +110,13 @@ const CaptionSimpleJob: React.FC<Props> = ({ jobConfig, setJobConfig, gpuIDs, se
             }}
             placeholder=""
             options={selectedCaptionOption?.name_or_path2_options || []}
+            suffix={
+              <ModelBrowseButton
+                value={jobConfig.config.process[0].caption.model_name_or_path2}
+                onPick={p => setJobConfig(p, 'config.process[0].caption.model_name_or_path2')}
+                className={standaloneBrowseClass}
+              />
+            }
           />
         </div>
       )}

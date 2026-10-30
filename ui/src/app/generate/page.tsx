@@ -40,6 +40,7 @@ import { getGenerateDefaults, GenerateDefaults } from '@/app/jobs/new/options';
 import { useModelArchs } from '@/extensions/modelArchs';
 import GenerateFooter from '@/components/generate/GenerateFooter';
 import LoraBrowserModal, { LoraPick } from '@/components/generate/LoraBrowserModal';
+import { ModelBrowseButton, standaloneBrowseClass } from '@/components/ModelBrowserModal';
 
 interface EngineStatus {
   running: boolean;
@@ -1042,6 +1043,13 @@ function GeneratePageInner() {
                         : []
                     }
                     placeholder="hub repo, local folder, or .safetensors"
+                    suffix={
+                      <ModelBrowseButton
+                        value={model.name_or_path}
+                        onPick={p => setModel(m => ({ ...m, name_or_path: p }))}
+                        className={standaloneBrowseClass}
+                      />
+                    }
                   />
                   {'extras_name_or_path' in (entry?.model || {}) && (
                     <TextInput
