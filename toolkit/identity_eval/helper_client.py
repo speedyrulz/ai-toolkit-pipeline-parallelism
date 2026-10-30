@@ -47,9 +47,9 @@ class SampleHelper:
         return self.proc is not None and self.proc.alive
 
     def render_async(self, items: List[dict], lora_path: Optional[str], sampler: str,
-                     sample_loras: Optional[List[dict]] = None):
+                     sample_loras: Optional[List[dict]] = None, scheduler: Optional[str] = None):
         self._render_id = self.proc.send("render", items=items, lora_path=lora_path, sampler=sampler,
-                                         sample_loras=sample_loras or [])
+                                         sample_loras=sample_loras or [], scheduler=scheduler)
 
     def render_wait(self):
         req, self._render_id = self._render_id, None

@@ -137,14 +137,18 @@ class IdentityEval:
             self.model_ids[role] = info.get("models") or {}
 
     def _fingerprint(self) -> dict:
+        sampler = {
+            "sampler": self.sample_config.sampler,
+            "guidance_rescale": self.sample_config.guidance_rescale,
+            "network_multiplier": self.sample_config.network_multiplier,
+        }
+        # only when set, so calibrations made before the option stay valid
+        if self.sample_config.scheduler != "default":
+            sampler["scheduler"] = self.sample_config.scheduler
         return {
             "model": self.model_fingerprint,
             "slots": slots_signature(self.slots),
-            "sampler": {
-                "sampler": self.sample_config.sampler,
-                "guidance_rescale": self.sample_config.guidance_rescale,
-                "network_multiplier": self.sample_config.network_multiplier,
-            },
+            "sampler": sampler,
             # extra sample LoRAs are part of every eval image, baseline included
             "sample_loras": [
                 {"file": M.fingerprint_model(l["path"]), "strength": float(l.get("strength", 1.0))}

@@ -10,7 +10,7 @@ plus the job's extra sample LoRAs at their own strengths (on every image, the
 network-off baseline included, as the trainer does).
 
 Commands:
-  render  {items: [GenerateImageConfig kwargs], lora_path, sampler, sample_loras}
+  render  {items: [GenerateImageConfig kwargs], lora_path, sampler, sample_loras, scheduler}
   offload / onload   move the model to cpu and back around gpu scoring
 """
 
@@ -115,7 +115,7 @@ def main():
             attached.append(extra)
         return attached
 
-    def render(items, lora_path=None, sampler=None, sample_loras=None):
+    def render(items, lora_path=None, sampler=None, sample_loras=None, scheduler=None):
         if state["offloaded"]:
             raise RuntimeError("render while offloaded")
         lora = get_lora(lora_path)
@@ -133,7 +133,7 @@ def main():
                         lora.strength = mult
                         lora.attach()
                     try:
-                        sd.generate_images(configs, sampler=sampler)
+                        sd.generate_images(configs, sampler=sampler, scheduler=scheduler)
                     finally:
                         if use_lora:
                             lora.detach()

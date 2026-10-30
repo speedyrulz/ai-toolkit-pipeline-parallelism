@@ -256,7 +256,7 @@ export interface SampleItem {
 
 export interface SampleConfig {
   sampler: string;
-  // sigma spacing for samples and likeness scoring prompts
+  // sigma spacing for samples and identity eval images
   scheduler?: 'default' | 'karras' | 'exponential';
   sample_every: number;
   sample_start_step: number;
