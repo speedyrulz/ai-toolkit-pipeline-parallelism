@@ -75,6 +75,7 @@ class IdentityEval:
         self._pending: List[dict] = []   # rounds scoring beside training
         self._ready_metrics: List[dict] = []
         self._helper_offloaded = None    # the sample helper, while background scoring holds its card
+        self._training_wait_s = 0.0      # time sample rounds waited on background scoring
 
     # ------------------------------------------------------------------
     # setup
@@ -88,6 +89,23 @@ class IdentityEval:
         """Rounds score beside training when no scoring worker shares the
         trainer's card (cpu workers, or gpu workers on the second card)."""
         return all(g is None or g < 0 or g != self.trainer_gpu for g in self.gpus.values())
+
+    def devices(self) -> Dict[str, str]:
+        return {r: "cpu" if g is not None and g < 0 else f"gpu {g}" for r, g in self.gpus.items()}
+
+    def _write_status(self, state: str, step: Optional[int] = None):
+        """status.json for the UI: how rounds are scored (beside training or
+        with training paused) and what scoring is doing right now."""
+        M.write_json(os.path.join(self.root, "status.json"), {
+            "mode": "background" if self.background else "paused",
+            "devices": self.devices(),
+            "trainer_gpu": self.trainer_gpu,
+            "state": state,  # idle | scoring | waiting | stopped
+            "step": step,
+            "pending_steps": [p["step"] for p in self._pending],
+            "training_wait_s": round(self._training_wait_s, 1),
+            "updated": time.strftime("%Y-%m-%d %H:%M:%S"),
+        })
 
     def _worker_models(self, role: str) -> dict:
         models = dict(self.cfg.models)
@@ -175,6 +193,7 @@ class IdentityEval:
                 self.close()
                 return False
         self.active = True
+        self._write_status("idle")
         return True
 
     def _prepare_workers(self, gpu_session) -> Dict[str, dict]:
@@ -345,14 +364,17 @@ class IdentityEval:
             self._score_background(step, images, helper)
         elif self.uses_gpu:
             print_acc(f"Identity eval: scoring step {step}")
+            self._write_status("scoring", step)
             t0 = time.time()
             try:
                 with self._session(gpu_session):
                     raw = self._score_images(images)
             except ChildError as e:
                 print_acc(f"Identity eval: scoring failed for step {step}: {e}")
+                self._write_status("idle")
                 return
             self._ready_metrics.append(self._finish_round(step, raw, time.time() - t0))
+            self._write_status("idle")
 
     def _score_background(self, step: int, images: Dict[str, List[dict]], helper):
         gpu_roles = [r for r in ROLES if self.gpus[r] is not None and self.gpus[r] >= 0]
@@ -372,9 +394,10 @@ class IdentityEval:
         except ChildError as e:
             print_acc(f"Identity eval: scoring failed for step {step}: {e}")
             return
-        where = f"gpu {self.second_gpu}" if gpu_roles else "cpu"
+        where = ", ".join(sorted(set(self.devices().values())))
         print_acc(f"Identity eval: scoring step {step} on {where} beside training")
         self._pending.append({"step": step, "ids": ids, "tail": tail, "t0": time.time(), "results": {}})
+        self._write_status("scoring", step)
 
     def _advance(self):
         still = []
@@ -395,7 +418,13 @@ class IdentityEval:
                 still.append(p)
             else:
                 self._ready_metrics.append(self._finish_round(p["step"], p["results"], time.time() - p["t0"]))
+        finished = len(still) < len(self._pending)
         self._pending = still
+        if finished:
+            if still:
+                self._write_status("scoring", still[0]["step"])
+            else:
+                self._write_status("idle")
 
     def poll(self) -> List[dict]:
         """Finished rounds as [{'step', 'metrics'}], oldest first."""
@@ -407,13 +436,20 @@ class IdentityEval:
         """Before a sample round: wait for background scoring to release the
         second card, then give it back to the sample helper. Finished rounds
         stay queued for the next poll()."""
-        deadline = time.time() + timeout_s
+        t0 = time.time()
+        deadline = t0 + timeout_s
         if self._pending:
             print_acc("Identity eval: waiting for background scoring to finish")
+            self._write_status("waiting", self._pending[0]["step"])
+        waited = bool(self._pending)
         while self._pending and time.time() < deadline:
             self._advance()
             if self._pending:
                 time.sleep(0.5)
+        if waited:
+            self._training_wait_s += time.time() - t0
+            self._write_status("scoring" if self._pending else "idle",
+                               self._pending[0]["step"] if self._pending else None)
         if self._helper_offloaded is not None:
             self._helper_offloaded.onload()
             self._helper_offloaded = None
@@ -500,6 +536,8 @@ class IdentityEval:
             "over_target_slots": over_target,
             "warnings": warnings,
             "seconds": round(seconds, 1),
+            "scored": "background" if self.background else "paused",
+            "devices": self.devices(),
             "per_image_path": os.path.join(os.path.basename(self.step_dir(step)), "per_image.json"),
         }
         folder = self.step_dir(step)
@@ -588,6 +626,8 @@ class IdentityEval:
         }
 
     def close(self):
+        if self.active:
+            self._write_status("stopped")
         for w in self.workers.values():
             w.close()
         self.workers = {}

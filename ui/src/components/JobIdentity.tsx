@@ -28,6 +28,7 @@ interface Round {
   over_target_slots: number;
   warnings: string[];
   seconds: number;
+  scored?: 'background' | 'paused';
 }
 
 interface SlotScore {
@@ -55,6 +56,17 @@ interface RankRow {
   checkpoint: string | null;
 }
 
+interface ScoringStatusData {
+  mode: 'background' | 'paused';
+  devices: Record<string, string>;
+  trainer_gpu: number;
+  state: 'idle' | 'scoring' | 'waiting' | 'stopped';
+  step: number | null;
+  pending_steps: number[];
+  training_wait_s: number;
+  updated: string;
+}
+
 interface IdentityData {
   exists: boolean;
   calibration_id?: string;
@@ -71,6 +83,7 @@ interface IdentityData {
   } | null;
   baseline_images?: Record<string, string>;
   step_images?: Record<number, Record<string, string>>;
+  status?: ScoringStatusData | null;
   ranking?: { criteria: { min_face: number; min_body: number; flex_max_drop: number }; rows: RankRow[] } | null;
   anchors?: {
     targets: Record<string, number | null>;
@@ -129,6 +142,39 @@ function BestCheckpoint({ ranking }: { ranking: IdentityData['ranking'] }) {
           : 'no checkpoint file saved at this step (not a save step, or removed by max saves)'}
       </div>
       <div className="text-xs text-gray-500 mt-1">gates: {gates}</div>
+    </div>
+  );
+}
+
+// How rounds are scored: beside training (background) or with training
+// paused. The live state only means something while the job is running.
+function ScoringStatus({ status, running }: { status: IdentityData['status']; running: boolean }) {
+  if (!status) return null;
+  const devices = Object.entries(status.devices ?? {})
+    .map(([r, d]) => `${r} on ${d.toUpperCase()}`)
+    .join(', ');
+  const background = status.mode === 'background';
+  let live = '';
+  if (running) {
+    if (status.state === 'scoring') live = `scoring step ${status.step}${background ? ' while training continues' : ''}`;
+    else if (status.state === 'waiting') live = `training is waiting for step ${status.step} to finish scoring`;
+    else if (status.state === 'idle') live = 'idle';
+  }
+  return (
+    <div className="bg-gray-900 rounded-lg p-4 text-sm">
+      <div className="text-xs uppercase text-gray-500">Scoring</div>
+      <div className={`mt-1 ${background ? 'text-emerald-400' : 'text-yellow-500'}`}>
+        {background
+          ? 'In the background: training keeps running while rounds are scored'
+          : `Training pauses for each round: a scorer shares the training GPU (GPU ${status.trainer_gpu})`}
+      </div>
+      <div className="text-xs text-gray-400 mt-1">
+        {devices}
+        {live && <span className={status.state === 'waiting' ? 'text-yellow-500' : ''}> · now: {live}</span>}
+        {background && status.training_wait_s > 0 && (
+          <span> · training has waited {Math.round(status.training_wait_s)}s for scoring this run</span>
+        )}
+      </div>
     </div>
   );
 }
@@ -259,6 +305,7 @@ export default function JobIdentity({ job }: { job: Job }) {
           identity (identity_eval backend is set to stub).
         </p>
       )}
+      <ScoringStatus status={data.status} running={job.status === 'running'} />
       <BestCheckpoint ranking={data.ranking} />
       <div className="flex flex-wrap gap-4">
         <Headline label="Face" value={latest?.face.score} sub={`coverage ${pct(latest?.face.coverage)}`} />
@@ -324,7 +371,15 @@ export default function JobIdentity({ job }: { job: Job }) {
                     )}
                   </td>
                   <td className="pr-4">{rankOf.get(r.step)?.checkpoint ? 'saved' : ''}</td>
-                  <td className="pr-4">{Math.round(r.seconds)}s</td>
+                  <td className="pr-4">
+                    {Math.round(r.seconds)}s
+                    {r.scored && (
+                      <span className="text-gray-500 text-xs">
+                        {' '}
+                        {r.scored === 'background' ? 'beside training' : 'training paused'}
+                      </span>
+                    )}
+                  </td>
                 </tr>
               ))}
             </tbody>

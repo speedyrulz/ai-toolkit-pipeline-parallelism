@@ -337,6 +337,11 @@ P3 is implemented:
 - **Background scoring** (see Two-GPU execution): the trainer no longer
   pauses for scoring when both workers are on the second card. Real-model
   test: 12 s rounds scored beside training.
+  `status.json` holds the mode (background or paused), the scorer devices,
+  what scoring is doing now and how long sample rounds waited on it; the
+  Identity tab shows it, each round records how it was scored, and the job
+  form says whether the chosen devices pause training. The job overview
+  shows every GPU the job uses (sample helper and scorers included).
 Still to do: a full training run with these changes (P3 exit criterion).
 
 `backend: stub` in `identity_eval` forces the placeholder for both workers.

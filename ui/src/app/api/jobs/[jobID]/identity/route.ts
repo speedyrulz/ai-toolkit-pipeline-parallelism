@@ -117,6 +117,7 @@ export async function GET(request: NextRequest, { params }: { params: { jobID: s
       baseline_images: slotImages(path.join(root, 'baseline')),
       step_images: stepImages,
       ranking,
+      status: await readJson(path.join(root, 'status.json')),
       anchors: anchors
         ? {
             targets: anchors.targets,

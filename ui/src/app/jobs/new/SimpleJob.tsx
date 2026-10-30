@@ -201,6 +201,14 @@ export default function SimpleJob({
   // the trainer's physical gpu (first of the job's gpu ids)
   const trainerGpu = `${gpuIDs ?? ''}`.split(',')[0];
   const identityEval = jobConfig.config.process[0].identity_eval;
+  // where each scorer ends up (the coordinator's defaults: face on the
+  // trainer's card, body on the sample helper's) and whether training
+  // pauses for scoring: it does when a scorer shares the trainer's card
+  const helperGpu = jobConfig.config.process[0].sample.helper_gpu;
+  const scorerGpus = [identityEval?.face_gpu ?? trainerGpu, identityEval?.body_gpu ?? helperGpu ?? trainerGpu].map(
+    g => `${g}`,
+  );
+  const scoringPausesTraining = scorerGpus.includes(trainerGpu);
   const scoringGpuOptions = [
     { value: '', label: 'Automatic' },
     { value: '-1', label: 'CPU (scores beside training)' },
@@ -2380,6 +2388,11 @@ export default function SimpleJob({
                       placeholder="empty = the toolkit's python"
                     />
                   </div>
+                  <p className={`text-xs mt-2 ${scoringPausesTraining ? 'text-yellow-500' : 'text-emerald-400'}`}>
+                    {scoringPausesTraining
+                      ? `Training pauses for each scoring round: a scorer is on the training GPU (#${trainerGpu}). Set both scoring devices to another GPU or CPU to score in the background.`
+                      : 'Scoring runs in the background: training keeps going while each round is scored.'}
+                  </p>
                   <p className="text-xs text-gray-500 mt-4">
                     Prompt suites: one prompt per line, optionally prefixed with a pose bin as{' '}
                     <code>front | prompt</code> (bins such as front, three_quarter, profile, side, back). Leave a suite
