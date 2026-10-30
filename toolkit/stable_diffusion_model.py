@@ -65,7 +65,7 @@ from huggingface_hub import hf_hub_download
 from toolkit.models.flux import add_model_gpu_splitter_to_flux, bypass_flux_guidance, restore_flux_guidance
 
 from optimum.quanto import freeze, qfloat8, QTensor, qint4
-from toolkit.util.quantize import quantize, get_qtype
+from toolkit.util.quantize import quantize, get_qtype, quantize_module
 from toolkit.accelerator import get_accelerator, unwrap_model
 from typing import TYPE_CHECKING
 from toolkit.print import print_acc
@@ -403,6 +403,8 @@ class StableDiffusion:
             model_path = get_model_path_from_url(self.model_config.name_or_path)
 
         load_args = {}
+        # set by loaders that quantize the unet before it is placed below
+        unet_is_quantized = False
         if self.noise_scheduler:
             load_args['scheduler'] = self.noise_scheduler
 
@@ -460,6 +462,38 @@ class StableDiffusion:
                 te1_state_dict['text_projection.weight'] = replacement_weight.to(self.device_torch, dtype=dtype)
                 flush()
                 print_acc("Injecting alt weights")
+
+            if self.model_config.quantize_te:
+                for i, te in enumerate(text_encoders):
+                    self.print_and_status_update(f"Quantizing text encoder {i + 1}")
+                    quantize_module(
+                        te,
+                        self.model_config.qtype_te,
+                        device=self.te_device_torch,
+                        dtype=self.te_torch_dtype,
+                        status_fn=self.print_and_status_update,
+                        keep_on_device=True,
+                    )
+                flush()
+
+            if self.model_config.quantize:
+                self.print_and_status_update("Quantizing UNet")
+                # a sharded unet is spread over its gpus after this, so leave the
+                # quantized blocks on the cpu instead of filling the primary
+                quantize_module(
+                    pipe.unet,
+                    self.model_config.qtype,
+                    device=self.device_torch,
+                    dtype=dtype,
+                    block_names=["down_blocks", "up_blocks"],
+                    # small layers the whole image passes through stay full precision
+                    exclude=["conv_in", "conv_out", "time_embedding*", "add_embedding*"],
+                    quantize_kwargs=self.model_config.quantize_kwargs,
+                    status_fn=self.print_and_status_update,
+                    keep_on_device=not self.model_config.pipeline_sharding,
+                )
+                unet_is_quantized = True
+                flush()
         elif self.model_config.is_v3:
             if self.custom_pipeline is not None:
                 pipln = self.custom_pipeline
@@ -1138,9 +1172,13 @@ class StableDiffusion:
                 self.unet,
                 devices=devices,
                 block_names=["down_blocks", "up_blocks"],
-                dtype=dtype,
+                # quantized weights only move devices; a dtype cast would
+                # dequantize them
+                dtype=None if unet_is_quantized else dtype,
                 balance=self.model_config.pipeline_balance,
             )
+        elif unet_is_quantized:
+            self.unet.to(self.device_torch)
         else:
             self.unet.to(self.device_torch, dtype=dtype)
         self.unet.requires_grad_(False)

@@ -863,7 +863,7 @@ export const AI_TOOLKIT_UI_MODELS: ModelArch[] = [
       "config.process[0].train.noise_scheduler": ["ddpm", "flowmatch"],
       "config.process[0].sample.guidance_scale": [6, 4],
     },
-    disableSections: ["model.quantize", "train.timestep_type"],
+    disableSections: ["train.timestep_type"],
     additionalSections: ["model.pipeline_sharding"],
   },
   {
