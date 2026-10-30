@@ -317,6 +317,8 @@ export interface CreatableSelectInputProps extends InputProps {
   disabled?: boolean;
   onChange: (value: string) => void;
   options: GroupedSelectOption[] | SelectOption[];
+  // rendered at the end of the input row, e.g. a browse button
+  suffix?: React.ReactNode;
 }
 
 const CUSTOM_SELECT_VALUE = '__custom__';
@@ -340,6 +342,11 @@ export const CreatableSelectInput = (props: CreatableSelectInputProps) => {
 
   const [isCustom, setIsCustom] = React.useState(!isInOptions && !!value);
   const customInputRef = React.useRef<HTMLInputElement>(null);
+
+  // a value set from outside (e.g. a browse dialog) that isn't a preset shows as custom
+  React.useEffect(() => {
+    if (value && !isInOptions) setIsCustom(true);
+  }, [value, isInOptions]);
 
   // Build select options with "Custom" at the top
   const customOption: SelectOption = { value: CUSTOM_SELECT_VALUE, label: 'Custom' };
@@ -421,6 +428,7 @@ export const CreatableSelectInput = (props: CreatableSelectInputProps) => {
             disabled={props.disabled}
           />
         )}
+        {props.suffix}
       </div>
     </div>
   );
