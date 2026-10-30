@@ -4,7 +4,7 @@ import useCPUInfo from '@/hooks/useCPUInfo';
 import GPUWidget from '@/components/GPUWidget';
 import CPUWidget from '@/components/CPUWidget';
 import FilesWidget from '@/components/FilesWidget';
-import { getTotalSteps } from '@/utils/jobs';
+import { getJobConfig, getTotalSteps } from '@/utils/jobs';
 import { Cpu, HardDrive, Info, Gauge } from 'lucide-react';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import useJobLog from '@/hooks/useJobLog';
@@ -14,17 +14,37 @@ interface JobOverviewProps {
 }
 
 export default function JobOverview({ job }: JobOverviewProps) {
-  const gpuIds = useMemo(() => {
+  // every card the job uses, with what it does: the assigned (training) GPUs,
+  // plus the sample helper and identity eval scorers when set to another card
+  const gpuRoles = useMemo(() => {
+    const roles = new Map<number, string[]>();
+    const add = (id: number | null | undefined, role: string) => {
+      if (id === null || id === undefined || isNaN(id) || id < 0) return;
+      roles.set(id, [...(roles.get(id) ?? []), role]);
+    };
     if (job.gpu_ids === 'mps') {
-      return [0]; // For MPS, we can just return a single GPU ID since it's virtualized
+      add(0, 'training'); // For MPS, we can just return a single GPU ID since it's virtualized
+      return roles;
     }
-    return job.gpu_ids.split(',').map(id => parseInt(id));
-  }, [job.gpu_ids]);
+    job.gpu_ids.split(',').forEach(id => add(parseInt(id), 'training'));
+    try {
+      const process = getJobConfig(job).config.process[0];
+      const helper = process.sample?.helper_gpu;
+      add(helper, 'sample helper');
+      const ie = process.identity_eval;
+      if (ie?.enabled) {
+        // unset scorers follow the coordinator defaults: face on the trainer's card, body on the helper's
+        add(ie.face_gpu ?? undefined, 'face scoring');
+        add(ie.body_gpu ?? helper ?? undefined, 'body scoring');
+      }
+    } catch {}
+    return roles;
+  }, [job.gpu_ids, job.job_config]);
+  const gpuIds = useMemo(() => Array.from(gpuRoles.keys()).sort((a, b) => a - b), [gpuRoles]);
   const { log, status: statusLog, refresh: refreshLog } = useJobLog(job.id, 2000);
   const logRef = useRef<HTMLDivElement>(null);
   // Track whether we should auto-scroll to bottom
   const [isScrolledToBottom, setIsScrolledToBottom] = useState(true);
-  console.log('job.gpu_ids', job.gpu_ids);
   const { gpuList, isGPUInfoLoaded } = useGPUInfo(gpuIds, 5000);
   const { cpuInfo, isCPUInfoLoaded } = useCPUInfo(5000);
   const totalSteps = getTotalSteps(job);
@@ -163,7 +183,15 @@ export default function JobOverview({ job }: JobOverviewProps) {
       {/* GPU Widget Panel */}
       <div className="md:col-span-1">
         <div>{isCPUInfoLoaded && cpuInfo && <CPUWidget cpu={cpuInfo} />}</div>
-        <div className="mt-4">{isGPUInfoLoaded && gpuList.length > 0 && <GPUWidget gpu={gpuList[0]} />}</div>
+        {isGPUInfoLoaded &&
+          gpuList.map(gpu => (
+            <div key={gpu.index} className="mt-4">
+              {gpuList.length > 1 && (
+                <p className="text-xs text-gray-400 mb-1">{(gpuRoles.get(gpu.index) ?? []).join(' · ')}</p>
+              )}
+              <GPUWidget gpu={gpu} />
+            </div>
+          ))}
         {jobType === 'train' && (
           <div className="mt-4">
             <FilesWidget jobID={job.id} jobName={job.name} />

@@ -78,57 +78,10 @@ class SampleItem:
         # only for models that support it, (qwen image edit 2509 for now)
         self.do_cfg_norm: bool = kwargs.get('do_cfg_norm', False)
 
-class LikenessConfig:
-    """Character likeness scoring (toolkit/likeness): after each sample round,
-    the round's images are scored against reference images of the character
-    for face, body shape and body detail likeness by a worker running in a
-    ComfyUI install that has the character-similarity custom nodes."""
-
-    def __init__(self, **kwargs):
-        self.enabled: bool = kwargs.get('enabled', False)
-        # folder of reference images of the character
-        self.reference_folder: str = kwargs.get('reference_folder', '')
-        # ComfyUI root; a \\wsl.localhost\<distro>\... path runs it in WSL
-        self.comfyui_path: str = kwargs.get('comfyui_path', '')
-        # ComfyUI's python; empty = <comfyui_path>/venv
-        self.python: str = kwargs.get('python', '')
-        # cpu keeps the scorer off the training gpus
-        self.device: str = kwargs.get('device', 'cpu')
-        self.cpu_threads: int = int(kwargs.get('cpu_threads', 0))
-        # gpu to score on when device is 'gpu', numbered like nvidia-smi and
-        # the UI's gpu list; -1 = the default gpu. Scoring peaks at about
-        # 3.5 GB, so pick a gpu with that much room beside training.
-        self.gpu_index: int = int(kwargs.get('gpu_index', -1))
-        # 'auto' = the bf16 checkpoint on cpu, int8 on gpu
-        self.sam3d_model: str = kwargs.get('sam3d_model', 'auto')
-        self.clip_vision_model: str = kwargs.get('clip_vision_model', 'dinov2_large.safetensors')
-        self.face_library: str = kwargs.get('face_library', 'insightface')
-        self.proportion_tolerance: float = float(kwargs.get('proportion_tolerance', 3.0))
-        self.build_tolerance: float = float(kwargs.get('build_tolerance', 8.0))
-        self.proportion_weight: float = float(kwargs.get('proportion_weight', 0.5))
-        # overall score weights for face, body shape, body detail
-        self.weights: List[float] = [float(w) for w in kwargs.get('weights', [1.0, 1.0, 1.0])]
-        # dedicated scoring prompts (str or dict like a sample item). Rendered
-        # every sample round with fixed seeds. Empty = score the regular samples
-        self.samples: List[Union[str, dict]] = kwargs.get('samples', []) or []
-        # first seed for the scoring prompts (each prompt adds its index);
-        # None = the sample config's seed
-        self.seed: Optional[int] = kwargs.get('seed', None)
-        # how long to wait for queued rounds after training ends
-        self.wait_at_end_minutes: float = float(kwargs.get('wait_at_end_minutes', 30))
-        if self.enabled:
-            if not self.reference_folder:
-                raise ValueError("sample.likeness.reference_folder is required")
-            if not self.comfyui_path:
-                raise ValueError("sample.likeness.comfyui_path is required")
-            if self.device not in ('cpu', 'gpu'):
-                raise ValueError("sample.likeness.device must be 'cpu' or 'gpu'")
-
-
 class SampleConfig:
     def __init__(self, **kwargs):
         self.sampler: str = kwargs.get('sampler', 'ddpm')
-        # sigma spacing for samples and likeness scoring prompts: default, karras, exponential
+        # sigma spacing for samples and identity eval images: default, karras, exponential
         self.scheduler: str = (kwargs.get('scheduler') or 'default').lower()
         if self.scheduler not in ('default', 'karras', 'exponential'):
             raise ValueError("sample.scheduler must be 'default', 'karras' or 'exponential'")
@@ -166,13 +119,17 @@ class SampleConfig:
         self.samples = [SampleItem(self, **item) for item in raw_samples]
         # only for models that support it, (qwen image edit 2509 for now)
         self.do_cfg_norm: bool = kwargs.get('do_cfg_norm', False)
-        # character likeness scoring of each sample round
-        self.likeness = LikenessConfig(**(kwargs.get('likeness') or {}))
         # extra LoRAs applied only while sampling, as forward-hook sidechains on
         # top of the network being trained: [{path, strength, name?}]
         self.loras: List[dict] = [
             l for l in (kwargs.get('loras') or []) if isinstance(l, dict) and l.get('path')
         ]
+        # physical gpu index (nvidia-smi / PCI order) of a second card that
+        # renders part of every sample round through a sample helper process
+        # holding its own copy of the base model. None = off. Not available
+        # with pipeline sharding.
+        helper_gpu = kwargs.get('helper_gpu', None)
+        self.helper_gpu: Optional[int] = None if helper_gpu in (None, '', -1) else int(helper_gpu)
 
     @property
     def prompts(self):
@@ -180,6 +137,64 @@ class SampleConfig:
         return [sample.prompt for sample in self.samples if sample.prompt is not None]
   
                 
+
+
+class IdentityEvalConfig:
+    """Character identity scoring of sample rounds (toolkit/identity_eval).
+    Fixed-seed face, body and flexibility prompt suites are rendered at step 0
+    with the network off and then every eval round; a scoring worker compares
+    them with reference images and reports calibrated 0-100 face, body and
+    identity scores. See docs/identity_eval_plan.md."""
+
+    def __init__(self, **kwargs):
+        self.enabled: bool = kwargs.get('enabled', False)
+        # score every Nth sample round
+        self.eval_every: int = max(1, int(kwargs.get('eval_every', 1)))
+        # python of the evaluator environment; empty = this python
+        self.evaluator_python: str = kwargs.get('evaluator_python', '') or ''
+        # physical gpu indices for the scoring workers; -1 = cpu. None = the
+        # trainer's gpu for face and the sample helper's gpu (else the
+        # trainer's) for body. While gpu scoring runs the trainer and the
+        # sample helper move their models to cpu.
+        self.face_gpu: Optional[int] = self._gpu(kwargs.get('face_gpu', None))
+        self.body_gpu: Optional[int] = self._gpu(kwargs.get('body_gpu', None))
+        # reference image folders; empty = the first dataset folder
+        self.face_references: str = kwargs.get('face_references', '') or ''
+        self.body_references: str = kwargs.get('body_references', '') or ''
+        self.holdout_references: str = kwargs.get('holdout_references', '') or ''
+        self.smplx_model_dir: str = kwargs.get('smplx_model_dir', '') or ''
+        # prompt suites: [str | {prompt, bin?, seed?, width?, height?, neg?}];
+        # a string may be 'bin | prompt' (bins: front, three_quarter, profile,
+        # side, back, ...). Empty = the built-in defaults (identity_eval/suites.py)
+        self.face_suite: List[Union[str, dict]] = kwargs.get('face_suite', []) or []
+        self.body_suite: List[Union[str, dict]] = kwargs.get('body_suite', []) or []
+        self.flex_suite: List[Union[str, dict]] = kwargs.get('flex_suite', []) or []
+        # first seed of the suites (each slot adds its index); None = sample seed
+        self.seed: Optional[int] = kwargs.get('seed', None)
+        # cpu scoring runs beside training; how long to wait for it at the end
+        self.wait_at_end_minutes: float = float(kwargs.get('wait_at_end_minutes', 30))
+        # fusion and guardrails (spec §6, plan "Flexibility guard")
+        self.face_weight: float = float(kwargs.get('face_weight', 0.55))
+        self.body_weight: float = float(kwargs.get('body_weight', 0.45))
+        self.target_quantile: float = float(kwargs.get('target_quantile', 0.75))
+        # flex guard: warn when prompt adherence (SigLIP, x100) drops more than
+        # this many points below step 0
+        self.flex_max_drop: float = float(kwargs.get('flex_max_drop', 3.0))
+        # checkpoint ranking: a round's checkpoint is eligible when face and
+        # body reach these scores and flex is within flex_max_drop
+        self.rank_min_face: float = float(kwargs.get('rank_min_face', 70.0))
+        self.rank_min_body: float = float(kwargs.get('rank_min_body', 70.0))
+        # scoring backend: 'auto' = real models where available, 'stub' = placeholder
+        self.backend: str = kwargs.get('backend', 'auto') or 'auto'
+        # model overrides for the face worker (identity_eval/worker/face.py
+        # DEFAULT_MODELS): face_pack_dir, cvlface_repo, aligner_repo, flex_model
+        self.models: dict = kwargs.get('models', {}) or {}
+
+    @staticmethod
+    def _gpu(value) -> Optional[int]:
+        if value is None or value == '':
+            return None
+        return int(value)
 
 
 class LormModuleSettingsConfig:

@@ -13,7 +13,7 @@ from torch.utils.data import DataLoader, ConcatDataset
 from toolkit import train_tools
 from toolkit.basic import value_map, adain, get_mean_std
 from toolkit.clip_vision_adapter import ClipVisionAdapter
-from toolkit.config_modules import GenerateImageConfig, SampleItem
+from toolkit.config_modules import GenerateImageConfig
 from toolkit.data_loader import get_dataloader_datasets
 from toolkit.data_transfer_object.data_loader import DataLoaderBatchDTO, FileItemDTO
 from toolkit.dto import DTO
@@ -280,30 +280,7 @@ class SDTrainer(BaseSDTrainProcess):
                     'conditional': positive,
                     'unconditional': negative
                 })
-
-            # likeness scoring prompts get their own cache, swapped in while
-            # they generate (the text encoder may be unloaded by then)
-            self.sd.likeness_prompts_cache = None
-            lk = self.sample_config.likeness
-            if lk.enabled and lk.samples:
-                self.sd.likeness_prompts_cache = []
-                for raw in lk.samples:
-                    item = SampleItem(self.sample_config, **(raw if isinstance(raw, dict) else {'prompt': raw}))
-                    prompt = item.prompt
-                    if self.trigger_word is not None:
-                        prompt = self.sd.inject_trigger_into_prompt(
-                            prompt, self.trigger_word, add_if_not_present=False
-                        )
-                    gen_img_config = GenerateImageConfig(
-                        prompt=prompt,
-                        negative_prompt=item.neg,
-                        output_path=output_path,
-                    )
-                    self.sd.likeness_prompts_cache.append({
-                        'conditional': self.sd.encode_prompt(gen_img_config.prompt).to('cpu'),
-                        'unconditional': self.sd.encode_prompt(gen_img_config.negative_prompt).to('cpu'),
-                    })
-
+        
 
     def before_dataset_load(self):
         self.assistant_adapter = None
@@ -433,7 +410,8 @@ class SDTrainer(BaseSDTrainProcess):
                     self.diff_output_preservation_embeds = self.cached_dop_class_embeds
                 
                 self.cache_sample_prompts()
-                
+                self.cache_identity_prompts()
+
                 print_acc("\n***** UNLOADING TEXT ENCODER *****")
                 if self.is_caching_text_embeddings:
                     print_acc("Embeddings cached to disk. We dont need the text encoder anymore")

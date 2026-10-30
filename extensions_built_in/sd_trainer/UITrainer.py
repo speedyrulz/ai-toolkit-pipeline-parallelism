@@ -284,11 +284,11 @@ class UITrainer(SDTrainer):
         self.update_status(
             "running", f"Generating images - {img_num + 1}/{total_imgs}")
 
-    def sample(self, step=None, is_first=False):
+    def sample(self, step=None, is_first=False, final=False):
         self.maybe_stop()
         total_imgs = len(self.sample_config.prompts)
         self.update_status("running", f"Generating images - 0/{total_imgs}")
-        super().sample(step, is_first)
+        super().sample(step, is_first, final=final)
         self.maybe_stop()
         self.update_status("running", "Training")
 

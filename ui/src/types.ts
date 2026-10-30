@@ -256,7 +256,7 @@ export interface SampleItem {
 
 export interface SampleConfig {
   sampler: string;
-  // sigma spacing for samples and likeness scoring prompts
+  // sigma spacing for samples and identity eval images
   scheduler?: 'default' | 'karras' | 'exponential';
   sample_every: number;
   sample_start_step: number;
@@ -272,35 +272,36 @@ export interface SampleConfig {
   num_frames: number;
   fps: number;
   duration?: number;
-  likeness?: LikenessConfig;
   // extra LoRAs applied only while sampling, on top of the network being trained
   loras?: SampleLora[];
+  // physical gpu index of a second card that renders part of each sample
+  // round (not with pipeline sharding)
+  helper_gpu?: number | null;
+}
+
+export interface IdentityEvalConfig {
+  enabled: boolean;
+  eval_every?: number;
+  evaluator_python?: string;
+  // physical gpu index, -1 = cpu, unset = automatic
+  face_gpu?: number | null;
+  body_gpu?: number | null;
+  face_references?: string;
+  body_references?: string;
+  holdout_references?: string;
+  smplx_model_dir?: string;
+  // 'bin | prompt' strings or objects; empty = built-in defaults
+  face_suite?: (string | { prompt: string; [key: string]: any })[];
+  body_suite?: (string | { prompt: string; [key: string]: any })[];
+  flex_suite?: (string | { prompt: string; [key: string]: any })[];
+  seed?: number;
+  wait_at_end_minutes?: number;
 }
 
 export interface SampleLora {
   path: string;
   name: string;
   strength: number;
-}
-
-export interface LikenessConfig {
-  enabled: boolean;
-  reference_folder: string;
-  comfyui_path: string;
-  python?: string;
-  device?: 'cpu' | 'gpu';
-  gpu_index?: number;
-  cpu_threads?: number;
-  sam3d_model?: string;
-  clip_vision_model?: string;
-  face_library?: string;
-  proportion_tolerance?: number;
-  build_tolerance?: number;
-  proportion_weight?: number;
-  weights?: number[];
-  samples?: (string | { prompt: string; [key: string]: any })[];
-  seed?: number;
-  wait_at_end_minutes?: number;
 }
 
 export interface LoggingConfig {
@@ -332,6 +333,7 @@ export interface ProcessConfig {
   logging: LoggingConfig;
   model: ModelConfig;
   sample: SampleConfig;
+  identity_eval?: IdentityEvalConfig;
 }
 
 export interface ConfigObject {

@@ -1,0 +1,12 @@
+# Identity eval scoring workers, on top of the toolkit's own requirements
+# (torch, torchvision, transformers, huggingface_hub, opencv, numpy, pillow,
+# safetensors, timm, einops, omegaconf). Also listed in requirements_base.txt.
+# face: onnxruntime-gpu 1.31 targets CUDA 13 and uses the CUDA runtime torch loads.
+onnxruntime-gpu>=1.31
+easydict
+# body: SAM 3D Body, SMPLest-X (code fetched at pinned commits) and SMPL-X
+roma
+yacs
+smplx
+pytorch-lightning
+braceexpand

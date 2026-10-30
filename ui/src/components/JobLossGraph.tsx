@@ -29,6 +29,11 @@ function clamp01(x: number) {
 }
 
 // Fallback canvas height used before the container has been measured.
+// identity eval scores (toolkit/identity_eval) share one fixed 0-100 axis;
+// identity/flex is a delta and keeps its own axis like every other metric
+const IDENTITY_SCALE = 'y::identity';
+const IDENTITY_SCORES = new Set(['identity/face', 'identity/body', 'identity/overall']);
+
 const FALLBACK_CANVAS_HEIGHT = 360;
 const MIN_CANVAS_HEIGHT = 160;
 
@@ -138,20 +143,6 @@ function dulledColor(rgba: string): string {
   return `rgba(${r},${g},${b},1)`;
 }
 
-// Character likeness scores (sample.likeness): one point per sample round on
-// a 0-100 scale. They share one fixed axis, are plotted raw (they are already
-// set averages, and EMA over a handful of sparse points would distort them),
-// and get their own toggle group. Colors sit outside PALETTE so they never
-// collide with a loss series.
-const LIKENESS_SERIES: { key: string; label: string; color: string }[] = [
-  { key: 'likeness/overall', label: 'Likeness (overall)', color: 'rgba(235,235,235,1)' },
-  { key: 'likeness/face', label: 'Face', color: 'rgba(255,150,210,1)' },
-  { key: 'likeness/body_shape', label: 'Body shape', color: 'rgba(110,200,255,1)' },
-  { key: 'likeness/body_detail', label: 'Body detail', color: 'rgba(255,200,100,1)' },
-];
-const LIKENESS_SCALE = 'y::likeness';
-const isLikenessKey = (k: string) => k.startsWith('likeness/');
-
 export default function JobLossGraph({ job }: Props) {
   const { series, lossKeys, status, refreshLoss, deleteRange } = useJobLossLog(job.id, 2000);
 
@@ -238,8 +229,7 @@ export default function JobLossGraph({ job }: Props) {
       const next = { ...prev };
       for (const k of lossKeys) {
         if (next[k] === undefined)
-          next[k] =
-            persistedEnabledRef.current?.[k] ?? (k === 'loss/loss' || k === 'val/loss' || k === 'likeness/overall');
+          next[k] = persistedEnabledRef.current?.[k] ?? (k === 'loss/loss' || k === 'val/loss');
       }
       for (const k of Object.keys(next)) {
         if (!lossKeys.includes(k)) delete next[k];
@@ -248,15 +238,7 @@ export default function JobLossGraph({ job }: Props) {
     });
   }, [lossKeys]);
 
-  // regular metrics vs the likeness group (only the four plotted likeness
-  // series; build/proportion stay in the likeness CSV, not the graph)
-  const regularKeys = useMemo(() => lossKeys.filter(k => !isLikenessKey(k)), [lossKeys]);
-  const likenessSeries = useMemo(() => LIKENESS_SERIES.filter(l => lossKeys.includes(l.key)), [lossKeys]);
-  const activeKeys = useMemo(() => regularKeys.filter(k => enabled[k] !== false), [regularKeys, enabled]);
-  const activeLikeness = useMemo(
-    () => likenessSeries.filter(l => enabled[l.key] !== false),
-    [likenessSeries, enabled],
-  );
+  const activeKeys = useMemo(() => lossKeys.filter(k => enabled[k] !== false), [lossKeys, enabled]);
 
   // Assign palette slots by position in the (sorted) lossKeys list rather than
   // by hashing the key name — hashing let different keys collide onto the same
@@ -264,12 +246,11 @@ export default function JobLossGraph({ job }: Props) {
   // repaints the others.
   const colorByKey = useMemo(() => {
     const m: Record<string, string> = {};
-    regularKeys.forEach((k, i) => {
+    lossKeys.forEach((k, i) => {
       m[k] = PALETTE[i % PALETTE.length];
     });
-    for (const l of LIKENESS_SERIES) m[l.key] = l.color;
     return m;
-  }, [regularKeys]);
+  }, [lossKeys]);
 
   // Build uPlot-aligned data + series configs.
   const built = useMemo(() => {
@@ -290,18 +271,6 @@ export default function JobLossGraph({ job }: Props) {
     }
     let xs = Array.from(stepSet).sort((a, b) => a - b);
     if (stride > 1) xs = xs.filter((_, i) => i % stride === 0);
-    // likeness points are sparse (one per sample round); never stride them out
-    const likenessSteps = new Set<number>();
-    for (const l of activeLikeness) {
-      for (const p of series[l.key] ?? []) {
-        if (p.value !== null && Number.isFinite(p.value as number)) likenessSteps.add(p.step);
-      }
-    }
-    if (likenessSteps.size) {
-      const merged = new Set<number>(xs);
-      likenessSteps.forEach(st => merged.add(st));
-      xs = Array.from(merged).sort((a, b) => a - b);
-    }
     if (windowSize > 0 && xs.length > windowSize) xs = xs.slice(xs.length - windowSize);
 
     const xsSet = new Set(xs);
@@ -326,12 +295,13 @@ export default function JobLossGraph({ job }: Props) {
 
     for (let ki = 0; ki < activeKeys.length; ki++) {
       const key = activeKeys[ki];
-      const scaleKey = `y::${key}`;
+      const identityScore = IDENTITY_SCORES.has(key);
+      const scaleKey = identityScore ? IDENTITY_SCALE : `y::${key}`;
       const pts: LossPoint[] = series[key] ?? [];
       const map = new Map<number, number>();
       for (const p of pts) {
         if (p.value === null || !Number.isFinite(p.value as number)) continue;
-        if (useLogScale && (p.value as number) <= 0) continue;
+        if (useLogScale && !identityScore && (p.value as number) <= 0) continue;
         if (!xsSet.has(p.step)) continue;
         map.set(p.step, p.value as number);
       }
@@ -377,6 +347,25 @@ export default function JobLossGraph({ job }: Props) {
         colArrays.push(fullSmooth);
       }
 
+      if (identityScore) {
+        // one shared scale and axis for all identity scores, never clipped
+        if (!scales[IDENTITY_SCALE]) {
+          scales[IDENTITY_SCALE] = { distr: 1, range: () => [0, 100] };
+          axes.push({
+            scale: IDENTITY_SCALE,
+            side: ki % 2 === 0 ? 3 : 1,
+            stroke: 'rgba(255,255,255,0.55)',
+            label: 'identity (0-100)',
+            labelSize: 14,
+            grid: { show: ki === 0, stroke: 'rgba(255,255,255,0.06)' },
+            ticks: { stroke: 'rgba(255,255,255,0.15)' },
+            size: 60,
+            values: (_u, ticks) => ticks.map(tk => formatNum(tk)),
+          });
+        }
+        continue;
+      }
+
       scaleArrays[scaleKey] = colArrays;
 
       scales[scaleKey] = {
@@ -412,44 +401,6 @@ export default function JobLossGraph({ job }: Props) {
       });
     }
 
-    // Likeness: raw values on one shared, fixed 0-100 scale. Linear even when
-    // Log Y is on (0 is a valid score).
-    if (activeLikeness.length) {
-      for (const l of activeLikeness) {
-        const map = new Map<number, number>();
-        for (const p of series[l.key] ?? []) {
-          if (p.value === null || !Number.isFinite(p.value as number)) continue;
-          if (!xsSet.has(p.step) && !likenessSteps.has(p.step)) continue;
-          map.set(p.step, p.value as number);
-        }
-        data.push(xs.map(st => (map.has(st) ? (map.get(st) as number) : null)));
-        const isOverall = l.key === 'likeness/overall';
-        seriesConfigs.push({
-          label: isOverall ? l.label : `${l.label} likeness`,
-          scale: LIKENESS_SCALE,
-          stroke: l.color,
-          width: isOverall ? 2.5 : 1.5,
-          dash: isOverall ? undefined : [6, 4],
-          spanGaps: true,
-          points: { show: true, size: isOverall ? 7 : 5, fill: l.color },
-          value: (_u, value) => (value == null ? '' : value.toFixed(1)),
-        });
-        sparseFlags.push(true);
-      }
-      scales[LIKENESS_SCALE] = { distr: 1, range: () => [0, 100] };
-      axes.push({
-        scale: LIKENESS_SCALE,
-        side: 1,
-        stroke: 'rgba(235,235,235,0.85)',
-        label: 'likeness (0-100)',
-        labelSize: 14,
-        grid: { show: activeKeys.length === 0, stroke: 'rgba(255,255,255,0.06)' },
-        ticks: { stroke: 'rgba(255,255,255,0.15)' },
-        size: 50,
-        values: (_u, ticks) => ticks.map(tk => tk.toFixed(0)),
-      });
-    }
-
     // y-domain clipping (2nd–98th percentile), computed per scale.
     let yClip: Record<string, { min: number; max: number }> | null = null;
     if (clipOutliers && xs.length >= 10) {
@@ -473,18 +424,7 @@ export default function JobLossGraph({ job }: Props) {
     }
 
     return { data: data as uPlot.AlignedData, seriesConfigs, scales, axes, yClip, sparseFlags };
-  }, [
-    series,
-    activeKeys,
-    activeLikeness,
-    colorByKey,
-    smoothing,
-    plotStride,
-    windowSize,
-    useLogScale,
-    showTrend,
-    clipOutliers,
-  ]);
+  }, [series, activeKeys, colorByKey, smoothing, plotStride, windowSize, useLogScale, showTrend, clipOutliers]);
 
   // Layout wrapper we measure for sizing — uPlot collapses its own mount node
   // to width:min-content, so we can't read sizes off it.
@@ -511,9 +451,8 @@ export default function JobLossGraph({ job }: Props) {
   // configs, which setData alone won't refresh.
   const sparseKey = built.sparseFlags.map(s => (s ? 1 : 0)).join('');
   const structuralKey = useMemo(
-    () =>
-      `${activeKeys.join('|')}|lk=${activeLikeness.map(l => l.key).join('|')}|trend=${showTrend}|log=${useLogScale}|has=${hasData}|sparse=${sparseKey}`,
-    [activeKeys, activeLikeness, showTrend, useLogScale, hasData, sparseKey],
+    () => `${activeKeys.join('|')}|trend=${showTrend}|log=${useLogScale}|has=${hasData}|sparse=${sparseKey}`,
+    [activeKeys, showTrend, useLogScale, hasData, sparseKey],
   );
 
   useEffect(() => {
@@ -736,11 +675,11 @@ export default function JobLossGraph({ job }: Props) {
 
           <div className="bg-gray-950 border border-gray-800 rounded-lg p-3">
             <label className="block text-xs text-gray-400 mb-2">Series</label>
-            {regularKeys.length === 0 ? (
+            {lossKeys.length === 0 ? (
               <div className="text-sm text-gray-400">No loss keys found yet.</div>
             ) : (
               <div className="flex flex-wrap gap-2">
-                {regularKeys.map(k => (
+                {lossKeys.map(k => (
                   <button
                     key={k}
                     type="button"
@@ -761,38 +700,6 @@ export default function JobLossGraph({ job }: Props) {
               </div>
             )}
           </div>
-
-          {likenessSeries.length > 0 && (
-            <div className="bg-gray-950 border border-gray-800 rounded-lg p-3 md:col-span-2">
-              <label className="block text-xs text-gray-400 mb-2">Likeness (0-100, one point per sample round)</label>
-              <div className="flex flex-wrap gap-2">
-                {likenessSeries.map(l => {
-                  const on = enabled[l.key] !== false;
-                  return (
-                    <button
-                      key={l.key}
-                      type="button"
-                      onClick={() => setEnabled(prev => ({ ...prev, [l.key]: !(prev[l.key] ?? true) }))}
-                      className={[
-                        'px-3 py-1 rounded-md text-xs border transition-colors',
-                        on
-                          ? 'bg-gray-800 text-gray-100 border-gray-600 hover:bg-gray-700/60'
-                          : 'bg-gray-900 text-gray-500 border-gray-800 hover:bg-gray-800/60',
-                      ].join(' ')}
-                      aria-pressed={on}
-                      title={l.key}
-                    >
-                      <span
-                        className="inline-block h-2 w-2 rounded-full mr-2"
-                        style={{ background: l.color, opacity: on ? 1 : 0.35 }}
-                      />
-                      {l.label}
-                    </button>
-                  );
-                })}
-              </div>
-            </div>
-          )}
 
           <div className="bg-gray-950 border border-gray-800 rounded-lg p-3">
             <div className="flex items-center justify-between mb-1">

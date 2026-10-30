@@ -1,3 +1,4 @@
+import contextlib
 import copy
 import glob
 import inspect
@@ -7,6 +8,7 @@ import shutil
 from collections import OrderedDict
 import os
 import re
+import time
 import traceback
 from typing import Union, List, Optional
 
@@ -62,8 +64,8 @@ import gc
 from tqdm import tqdm
 
 from toolkit.config_modules import SaveConfig, LoggingConfig, SampleConfig, NetworkConfig, TrainConfig, ModelConfig, \
-    GenerateImageConfig, SampleItem, EmbeddingConfig, DatasetConfig, preprocess_dataset_raw_config, AdapterConfig, GuidanceConfig, validate_configs, \
-    DecoratorConfig
+    GenerateImageConfig, EmbeddingConfig, DatasetConfig, preprocess_dataset_raw_config, AdapterConfig, GuidanceConfig, validate_configs, \
+    DecoratorConfig, IdentityEvalConfig
 from toolkit.logging_aitk import create_logger
 from diffusers import FluxTransformer2DModel
 from toolkit.accelerator import get_accelerator, unwrap_model
@@ -126,6 +128,18 @@ class BaseSDTrainProcess(BaseTrainProcess):
         else:
             self.has_first_sample_requested = False
             self.first_sample_config = self.sample_config
+        # character identity scoring of sample rounds (toolkit/identity_eval)
+        self.identity_eval_config = IdentityEvalConfig(**(self.get_conf('identity_eval', None) or {}))
+        if self.model_config.pipeline_sharding:
+            if self.identity_eval_config.enabled:
+                raise ValueError("identity_eval is not available with pipeline_sharding")
+            if self.sample_config.helper_gpu is not None:
+                raise ValueError("sample.helper_gpu is not available with pipeline_sharding")
+        self.identity_eval = None
+        self.sample_helper = None
+        # prompt embeddings for the identity suites, for when the text encoder
+        # is unloaded before sampling (filled by cache_identity_prompts)
+        self._identity_prompt_cache = {}
         self.logging_config = LoggingConfig(**self.get_conf('logging', {}))
         self.logger = create_logger(self.logging_config, config, self.save_root)
         self.optimizer: torch.optim.Optimizer = None
@@ -281,9 +295,12 @@ class BaseSDTrainProcess(BaseTrainProcess):
         # override in subclass
         return generate_image_config_list
 
-    def sample(self, step=None, is_first=False):
+    def sample(self, step=None, is_first=False, final=False):
         if not self.accelerator.is_main_process:
             return
+        if self.identity_eval is not None:
+            # background scoring holds the second card until it finishes
+            self.identity_eval.drain()
         flush()
         sample_folder = os.path.join(self.save_root, 'samples')
         gen_img_config_list = []
@@ -338,7 +355,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
             if sample_item.seed is not None:
                 current_seed = sample_item.seed
 
-            gen_img_config_list.append(GenerateImageConfig(
+            item = dict(
                 prompt=prompt,  # it will autoparse the prompt
                 width=sample_item.width,
                 height=sample_item.height,
@@ -353,7 +370,6 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 adapter_conditioning_scale=sample_config.adapter_conditioning_scale,
                 refiner_start_at=sample_config.refiner_start_at,
                 extra_values=sample_config.extra_values,
-                logger=self.logger,
                 num_frames=sample_item.num_frames,
                 fps=sample_item.fps,
                 duration=sample_item.duration,
@@ -364,10 +380,22 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 ctrl_img_3=sample_item.ctrl_img_3,
                 do_cfg_norm=sample_config.do_cfg_norm,
                 **extra_args
-            ))
+            )
+            item['_cache_key'] = f"sample:{i}"
+            # odd prompts go to the sample helper's card when there is one
+            item['_renderer'] = 'helper' if i % 2 == 1 else 'main'
+            gen_img_config_list.append(item)
 
-        # post process
-        gen_img_config_list = self.post_process_generate_image_config_list(gen_img_config_list)
+        # identity eval suites ride along with this round's samples, with the
+        # same sampler settings and extra sample LoRAs (the step-0 baseline
+        # has them too, so only the trained network differs between rounds)
+        identity_round = (
+            self.identity_eval is not None
+            and not is_first
+            and self.identity_eval.is_eval_step(step, final=final)
+        )
+        if identity_round:
+            gen_img_config_list.extend(self.identity_eval.round_items(step))
 
         # if we have an ema, set it to validation mode
         if self.ema is not None:
@@ -376,21 +404,11 @@ class BaseSDTrainProcess(BaseTrainProcess):
         # let adapter know we are sampling
         if self.adapter is not None and isinstance(self.adapter, CustomAdapter):
             self.adapter.is_sampling = True
-        
-        likeness_on = (
-            not is_first
-            and step is not None
-            and getattr(self, 'likeness_scorer', None) is not None
-        )
-        files_before = set(os.listdir(sample_folder)) if likeness_on and os.path.isdir(sample_folder) else set()
 
         sample_loras = self._attach_sample_loras(sample_config)
         try:
             # send to be generated
-            self.sd.generate_images(gen_img_config_list, sampler=sample_config.sampler, scheduler=sample_config.scheduler)
-
-            if likeness_on:
-                self._likeness_sample_round(step, sample_config, sample_folder, files_before)
+            self._render_items(gen_img_config_list, sample_config)
         finally:
             for lora in sample_loras:
                 lora.detach()
@@ -400,7 +418,253 @@ class BaseSDTrainProcess(BaseTrainProcess):
 
         if self.ema is not None:
             self.ema.train()
+
+        if identity_round:
+            self.identity_eval.score_round(step, self._gpu_session, helper=self.sample_helper)
         print_acc("") # add a line break
+
+    # ------------------------------------------------------------------
+    # Rendering split across the trainer's card and the sample helper's
+    # ------------------------------------------------------------------
+
+    def _helper_usable(self, sample_config) -> bool:
+        return (
+            self.sample_helper is not None
+            and self.sample_helper.alive
+            and self._helper_compatible(sample_config)
+        )
+
+    def _helper_compatible(self, sample_config) -> bool:
+        """Whether the sample helper can reproduce this job's sampling: it
+        loads the plain base model and applies the network and the extra
+        sample LoRAs as linear LoRA hooks, so anything beyond that stays on
+        the trainer's card."""
+        if self.is_fine_tuning or self.embedding is not None or self.adapter is not None:
+            return False
+        if self.model_config.refiner_name_or_path is not None:
+            return False
+        if self.network_config is not None and (
+            self.network_config.conv or self.network_config.type.lower() not in ('lora', 'lokr')
+        ):
+            return False
+        if type(self).post_process_generate_image_config_list is not BaseSDTrainProcess.post_process_generate_image_config_list:
+            return False
+        return True
+
+    def _render_items(self, items, sample_config):
+        """Generate images from GenerateImageConfig kwargs dicts. Each dict
+        carries _renderer ('main' | 'helper') and _cache_key (its prompt
+        embedding in sample_prompts_cache or the identity prompt cache)."""
+        use_helper = self._helper_usable(sample_config)
+        main_items, helper_items = [], []
+        for item in items:
+            # placeholders resolve per list, so bake the image index in now
+            item['output_path'] = item['output_path'].replace('[count]', str(len(main_items) + len(helper_items)))
+            on_helper = (
+                use_helper
+                and item['_renderer'] == 'helper'
+                and not item.get('ctrl_img') and not item.get('adapter_image_path')
+            )
+            if not on_helper and item['_renderer'] == 'helper' and item['_cache_key'].startswith('identity:') \
+                    and self.identity_eval is not None and self.identity_eval.uses_helper_renderer:
+                # the slot's baseline came from the other card; same-seed
+                # images can differ slightly between card architectures
+                print_acc(f"Identity eval warning: slot {item['_cache_key'][9:]} rendered on the trainer's gpu "
+                          "instead of the sample helper's; its score is less comparable")
+            (helper_items if on_helper else main_items).append(item)
+
+        if helper_items:
+            lora_path = None
+            if self.network is not None and any(i['network_multiplier'] != 0 for i in helper_items):
+                lora_path = os.path.join(self.sample_helper.work_dir, 'network_snapshot.safetensors')
+                prev_multiplier = self.network.multiplier
+                self.network.multiplier = 1.0
+                try:
+                    self.network.save_weights(lora_path, dtype=torch.float32)
+                finally:
+                    self.network.multiplier = prev_multiplier
+            strip = [{k: v for k, v in i.items() if not k.startswith('_')} for i in helper_items]
+            self.sample_helper.render_async(strip, lora_path, sample_config.sampler, sample_config.loras,
+                                            scheduler=sample_config.scheduler)
+
+        try:
+            if main_items:
+                configs = [
+                    GenerateImageConfig(**{k: v for k, v in i.items() if not k.startswith('_')}, logger=self.logger)
+                    for i in main_items
+                ]
+                configs = self.post_process_generate_image_config_list(configs)
+                regular_cache = self.sd.sample_prompts_cache
+                swap = regular_cache is not None and (
+                    helper_items or any(not i['_cache_key'].startswith('sample:') for i in main_items)
+                )
+                if swap:
+                    # generate_images reads cached embeddings by list index
+                    self.sd.sample_prompts_cache = [self._cached_embeds(i['_cache_key'], regular_cache) for i in main_items]
+                try:
+                    self.sd.generate_images(configs, sampler=sample_config.sampler, scheduler=sample_config.scheduler)
+                finally:
+                    if swap:
+                        self.sd.sample_prompts_cache = regular_cache
+        finally:
+            if helper_items:
+                self.sample_helper.render_wait()
+
+    def _cached_embeds(self, key, regular_cache):
+        kind, _, ref = key.partition(':')
+        if kind == 'sample':
+            return regular_cache[int(ref)]
+        if ref not in self._identity_prompt_cache:
+            raise RuntimeError(f"no cached prompt embeddings for identity slot {ref}")
+        return self._identity_prompt_cache[ref]
+
+    def cache_identity_prompts(self):
+        """Encode the identity suite prompts while the text encoder is still
+        loaded; called by trainers that unload it after caching sample prompts."""
+        if not self.identity_eval_config.enabled:
+            return
+        from toolkit.identity_eval.suites import build_slots
+        slots = build_slots(self.identity_eval_config, self.sample_config,
+                            use_helper=self.sample_config.helper_gpu is not None)
+        for s in slots:
+            prompt = s['prompt']
+            if self.trigger_word is not None:
+                prompt = self.sd.inject_trigger_into_prompt(prompt, self.trigger_word, add_if_not_present=False)
+            self._identity_prompt_cache[s['id']] = {
+                'conditional': self.sd.encode_prompt(prompt).to('cpu'),
+                'unconditional': self.sd.encode_prompt(s['neg']).to('cpu'),
+            }
+
+    # ------------------------------------------------------------------
+    # Identity eval lifecycle (toolkit/identity_eval)
+    # ------------------------------------------------------------------
+
+    def _trainer_gpu_index(self) -> int:
+        """Physical (PCI order) index of the trainer's card."""
+        visible = os.environ.get('CUDA_VISIBLE_DEVICES')
+        local = (self.device_torch.index or 0) if self.device_torch.type == 'cuda' else 0
+        if visible:
+            ids = [v.strip() for v in visible.split(',') if v.strip()]
+            if local < len(ids) and ids[local].isdigit():
+                return int(ids[local])
+        return local
+
+    @contextlib.contextmanager
+    def _gpu_session(self):
+        """Free the cards for gpu scoring: the training model (and the sample
+        helper's) move to cpu, then come back exactly where they were. LoRA
+        parameters and optimizer state stay on the gpu."""
+        t0 = time.time()
+        if self.sample_helper is not None:
+            self.sample_helper.offload()
+        self.sd.set_device_state_preset('unload')
+        saved_state = self.sd.device_state
+        flush()
+        try:
+            yield
+        finally:
+            self.sd.restore_device_state()
+            if self.sample_helper is not None:
+                self.sample_helper.onload()
+            unet_device = next(self.sd.unet.parameters()).device
+            want = torch.device(saved_state['unet']['device'])
+            if unet_device.type != want.type or (want.index is not None and unet_device.index != want.index):
+                raise RuntimeError(
+                    f"identity eval: the training model did not return to {want} after scoring (it is on {unet_device})"
+                )
+            print_acc(f"Identity eval: gpu hand-off and reload took {time.time() - t0:.0f}s in total")
+
+    def _identity_start(self):
+        """Start the sample helper and identity eval before the first sample."""
+        if not self.accelerator.is_main_process or self.train_config.disable_sampling:
+            return
+        # second card: the sample helper renders on it, and identity eval
+        # scores body images on it, both only outside pipeline sharding
+        second_gpu = self.sample_config.helper_gpu
+        if second_gpu is not None and second_gpu == self._trainer_gpu_index():
+            print_acc(f"sample.helper_gpu {second_gpu} is the trainer's own gpu; ignoring it")
+            second_gpu = None
+        if second_gpu is not None:
+            if not self._helper_compatible(self.sample_config):
+                print_acc("This job uses features the sample helper does not reproduce "
+                          "(adapters, embeddings, refiner or conv/LoRM networks); "
+                          "sampling stays on the trainer's gpu")
+            else:
+                from toolkit.identity_eval.helper_client import SampleHelper
+                model_conf = copy.deepcopy(self.get_conf('model', {}))
+                model_conf['dtype'] = self.train_config.dtype
+                helper = SampleHelper(second_gpu, os.path.join(self.save_root, '.sample_helper'),
+                                      model_conf, self.train_config.dtype, self.train_config.noise_scheduler)
+                if helper.start():
+                    self.sample_helper = helper
+                    import atexit
+                    atexit.register(helper.close)
+
+        if not self.identity_eval_config.enabled:
+            return
+        from toolkit.identity_eval.coordinator import IdentityEval
+        from toolkit.identity_eval.manifest import fingerprint_model
+        datasets = self.get_conf('datasets', None) or []
+        default_refs = datasets[0].get('folder_path', '') if datasets else ''
+
+        def prompt_fn(prompt):
+            if self.trigger_word is not None:
+                return self.sd.inject_trigger_into_prompt(prompt, self.trigger_word, add_if_not_present=False)
+            return prompt
+
+        ie = IdentityEval(
+            self.identity_eval_config, self.sample_config, self.save_root,
+            trainer_gpu=self._trainer_gpu_index(),
+            second_gpu=second_gpu,
+            use_helper=self._helper_usable(self.sample_config),
+            default_references=default_refs,
+            model_fingerprint=fingerprint_model(self.model_config.name_or_path),
+            prompt_fn=prompt_fn,
+        )
+        import atexit
+        atexit.register(ie.close)
+        if self.ema is not None:
+            self.ema.eval()
+        def render_baseline(items):
+            # same extra sample LoRAs as every later round
+            sample_loras = self._attach_sample_loras(self.sample_config)
+            try:
+                self._render_items(items, self.sample_config)
+            finally:
+                for lora in sample_loras:
+                    lora.detach()
+
+        try:
+            started = ie.start(render_baseline, self._gpu_session)
+        finally:
+            if self.ema is not None:
+                self.ema.train()
+        if started:
+            self.identity_eval = ie
+
+    def _identity_log(self, rounds):
+        for r in rounds:
+            if r['metrics']:
+                if self.writer is not None:
+                    for k, v in r['metrics'].items():
+                        self.writer.add_scalar(k, v, r['step'])
+                # scores land after their round; log them against the step
+                # they measure, at a point where nothing else is pending
+                self.logger.log(r['metrics'])
+                self.logger.commit(step=r['step'])
+
+    def _identity_poll(self):
+        if self.identity_eval is not None:
+            self._identity_log(self.identity_eval.poll())
+
+    def _identity_finish(self):
+        if self.identity_eval is not None:
+            self._identity_log(self.identity_eval.finish(self.identity_eval_config.wait_at_end_minutes * 60))
+            self.identity_eval.close()
+            self.identity_eval = None
+        if self.sample_helper is not None:
+            self.sample_helper.close()
+            self.sample_helper = None
 
     def _attach_sample_loras(self, sample_config):
         """Attach the sample config's extra LoRAs as forward-hook sidechains at
@@ -440,136 +704,6 @@ class BaseSDTrainProcess(BaseTrainProcess):
         if attached:
             print_acc("Sampling with LoRA(s): " + ", ".join(f"{l.name} @ {l.strength:g}" for l in attached))
         return attached
-
-    # ------------------------------------------------------------------
-    # Character likeness scoring (toolkit/likeness)
-    # ------------------------------------------------------------------
-
-    def _likeness_start(self):
-        lk = self.sample_config.likeness if self.sample_config is not None else None
-        self.likeness_scorer = None
-        if lk is None or not lk.enabled or not self.accelerator.is_main_process:
-            return
-        from toolkit.likeness.scorer import LikenessScorer
-        scorer = LikenessScorer(lk, os.path.join(self.save_root, 'likeness'))
-        try:
-            scorer.start()
-        except Exception as e:
-            print_acc(f"Likeness scoring disabled, the worker could not start: {e}")
-            return
-        self.likeness_scorer = scorer
-        import atexit
-        atexit.register(scorer.close)
-
-    def _likeness_sample_round(self, step, sample_config, sample_folder, files_before):
-        scorer = self.likeness_scorer
-        lk = sample_config.likeness
-        round_folder = os.path.join(self.save_root, 'likeness', 'samples', f"step_{int(step):09d}")
-        os.makedirs(round_folder, exist_ok=True)
-        image_exts = ('.png', '.jpg', '.jpeg', '.webp')
-
-        if lk.samples:
-            # dedicated scoring prompts with fixed seeds, the same every round
-            base_seed = lk.seed if lk.seed is not None else sample_config.seed
-            configs = []
-            for i, raw in enumerate(lk.samples):
-                item = SampleItem(sample_config, **(raw if isinstance(raw, dict) else {'prompt': raw}))
-                prompt = item.prompt
-                if self.trigger_word is not None:
-                    prompt = self.sd.inject_trigger_into_prompt(
-                        prompt, self.trigger_word, add_if_not_present=False
-                    )
-                ext = sample_config.ext if sample_config.ext in ('png', 'jpg', 'jpeg', 'webp') else 'png'
-                configs.append(GenerateImageConfig(
-                    prompt=prompt,
-                    width=item.width,
-                    height=item.height,
-                    negative_prompt=item.neg,
-                    seed=item.seed if item.seed is not None else base_seed + i,
-                    guidance_scale=item.guidance_scale,
-                    guidance_rescale=sample_config.guidance_rescale,
-                    num_inference_steps=item.sample_steps,
-                    network_multiplier=item.network_multiplier,
-                    output_path=os.path.join(round_folder, f"likeness_{i:02d}.{ext}"),
-                    output_ext=ext,
-                    refiner_start_at=sample_config.refiner_start_at,
-                    extra_values=sample_config.extra_values,
-                    logger=self.logger,
-                ))
-            configs = self.post_process_generate_image_config_list(configs)
-            print_acc(f"Generating {len(configs)} likeness scoring samples")
-            # generate_images reads prompt embeddings from sample_prompts_cache
-            # by index when the prompts were pre-encoded; point it at the
-            # scoring prompts' own cache for this call
-            regular_cache = self.sd.sample_prompts_cache
-            if regular_cache is not None:
-                self.sd.sample_prompts_cache = getattr(self.sd, 'likeness_prompts_cache', None)
-            try:
-                self.sd.generate_images(configs, sampler=sample_config.sampler, scheduler=sample_config.scheduler)
-            finally:
-                self.sd.sample_prompts_cache = regular_cache
-        else:
-            # score this round's regular samples
-            new_files = sorted(
-                f for f in set(os.listdir(sample_folder)) - files_before
-                if f.lower().endswith(image_exts)
-            )
-            for f in new_files:
-                shutil.copy2(os.path.join(sample_folder, f), os.path.join(round_folder, f))
-
-        if not any(f.lower().endswith(image_exts) for f in os.listdir(round_folder)):
-            print_acc(f"Likeness: no images to score for step {step}")
-            return
-        if not scorer.submit(step, round_folder):
-            print_acc(f"Likeness scoring unavailable: {scorer.failed or 'worker stopped'}")
-            self.likeness_scorer = None
-
-    def _likeness_log_results(self, results):
-        for r in results:
-            step = r.get('step')
-            if 'fatal' in r:
-                print_acc(f"\nLikeness scoring stopped: {r['fatal']} (see likeness/likeness_worker.log)")
-                continue
-            if 'error' in r:
-                print_acc(f"\nLikeness scoring failed for step {step}: {r['error']}")
-                continue
-
-            def fmt(v):
-                return '-' if v is None else f"{v:.1f}"
-
-            print_acc(
-                f"\nLikeness @ step {step}: overall {fmt(r.get('overall'))} | face {fmt(r.get('face'))}"
-                f" | body shape {fmt(r.get('body_shape'))} | body detail {fmt(r.get('body_detail'))}"
-                f"  ({r.get('images')} images, {r.get('seconds', 0):.0f}s)"
-            )
-            metrics = {
-                f'likeness/{k}': r[k]
-                for k in ('overall', 'face', 'body_shape', 'body_detail', 'build', 'proportion')
-                if r.get(k) is not None
-            }
-            if metrics and self.accelerator.is_main_process:
-                if self.writer is not None:
-                    for k, v in metrics.items():
-                        self.writer.add_scalar(k, v, step)
-                # scores arrive after their round; log them against the step
-                # they measure. Called only when nothing else is pending.
-                self.logger.log(metrics)
-                self.logger.commit(step=step)
-
-    def _likeness_poll(self):
-        if getattr(self, 'likeness_scorer', None) is not None:
-            self._likeness_log_results(self.likeness_scorer.poll())
-
-    def _likeness_finish(self):
-        scorer = getattr(self, 'likeness_scorer', None)
-        if scorer is None:
-            return
-        wait_s = self.sample_config.likeness.wait_at_end_minutes * 60
-        self._likeness_log_results(scorer.finish(wait_s))
-        if scorer.pending:
-            print_acc(f"Likeness scoring did not finish for step(s) "
-                      f"{', '.join(str(s) for s in scorer.pending)}")
-        self.likeness_scorer = None
 
     def update_training_metadata(self):
         o_dict = OrderedDict({
@@ -3054,12 +3188,13 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     print_acc(f"Failed to compile model: {e}")
                     print_acc("Continuing without compilation")
 
+        # sample helper on the second gpu, then identity eval calibration
+        # (step-0 baseline renders with the network off)
+        self._identity_start()
+
         if self.has_first_sample_requested and self.step_num <= 1 and not self.train_config.disable_sampling:
             print_acc("Generating first sample from first sample config")
             self.sample(0, is_first=True)
-
-        # character likeness scorer: loads its models in the background
-        self._likeness_start()
 
         # sample first
         if self.train_config.skip_first_sample or self.train_config.disable_sampling:
@@ -3137,7 +3272,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
             if self.train_config.do_paramiter_swapping:
                 self.optimizer.optimizer.swap_paramiters()
             self.timer.start('train_loop')
-            self._likeness_poll()
+            self._identity_poll()
             if flush_next:
                 flush()
                 flush_next = False
@@ -3433,9 +3568,9 @@ class BaseSDTrainProcess(BaseTrainProcess):
         if self.accelerator.is_main_process:
             self.save()
         if not self.train_config.disable_sampling:
-            self.sample(self.step_num)
+            self.sample(self.step_num, final=True)
             self.logger.commit(step=self.step_num)
-        self._likeness_finish()
+        self._identity_finish()
         print_acc("")
         if self.accelerator.is_main_process:
             self.logger.finish()

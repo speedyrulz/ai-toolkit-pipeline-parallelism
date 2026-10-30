@@ -199,6 +199,25 @@ export default function SimpleJob({
   }, [modelArch]);
 
   const showGPUSelect = !isMac();
+  // the trainer's physical gpu (first of the job's gpu ids)
+  const trainerGpu = `${gpuIDs ?? ''}`.split(',')[0];
+  const identityEval = jobConfig.config.process[0].identity_eval;
+  // where each scorer ends up (the coordinator's defaults: face on the
+  // trainer's card, body on the sample helper's) and whether training
+  // pauses for scoring: it does when a scorer shares the trainer's card
+  const helperGpu = jobConfig.config.process[0].sample.helper_gpu;
+  const scorerGpus = [identityEval?.face_gpu ?? trainerGpu, identityEval?.body_gpu ?? helperGpu ?? trainerGpu].map(
+    g => `${g}`,
+  );
+  const scoringPausesTraining = scorerGpus.includes(trainerGpu);
+  const scoringGpuOptions = [
+    { value: '', label: 'Automatic' },
+    { value: '-1', label: 'CPU (scores beside training)' },
+    ...gpuList.map((gpu: any) => ({ value: `${gpu.index}`, label: `GPU #${gpu.index}` })),
+  ];
+  const suiteToText = (suite?: (string | { prompt: string; [key: string]: any })[]) =>
+    (suite ?? []).map(s => (typeof s === 'string' ? s : s.bin ? `${s.bin} | ${s.prompt}` : s.prompt)).join('\n');
+  const textToSuite = (value: string) => value.split('\n').filter((line: string) => line.trim() !== '');
 
   const [sampleLoraModalOpen, setSampleLoraModalOpen] = useState(false);
   const sampleLoras: SampleLora[] = jobConfig.config.process[0].sample.loras || [];
@@ -524,7 +543,14 @@ export default function SimpleJob({
                   <Checkbox
                     label="Multi-GPU (Pipeline Sharding)"
                     checked={jobConfig.config.process[0].model.pipeline_sharding || false}
-                    onChange={value => setJobConfig(value, 'config.process[0].model.pipeline_sharding')}
+                    onChange={value => {
+                      setJobConfig(value, 'config.process[0].model.pipeline_sharding');
+                      if (value) {
+                        // neither the sample helper nor identity eval runs with sharding
+                        setJobConfig(undefined, 'config.process[0].sample.helper_gpu');
+                        setJobConfig(undefined, 'config.process[0].identity_eval');
+                      }
+                    }}
                     docKey="model.pipeline_sharding"
                   />
                   {jobConfig.config.process[0].model.pipeline_sharding &&
@@ -1730,6 +1756,22 @@ export default function SimpleJob({
                   min={0}
                   required
                 />
+                {gpuList.length > 1 && !jobConfig.config.process[0].model.pipeline_sharding && (
+                  <SelectInput
+                    label="Second GPU for Sampling"
+                    className="pt-2"
+                    value={`${jobConfig.config.process[0].sample.helper_gpu ?? ''}`}
+                    onChange={value =>
+                      setJobConfig(value === '' ? undefined : parseInt(value), 'config.process[0].sample.helper_gpu')
+                    }
+                    options={[
+                      { value: '', label: 'Off' },
+                      ...gpuList
+                        .filter((gpu: any) => `${gpu.index}` !== trainerGpu)
+                        .map((gpu: any) => ({ value: `${gpu.index}`, label: `GPU #${gpu.index}` })),
+                    ]}
+                  />
+                )}
                 {!isLlmModel && (
                   <>
                     <SelectInput
@@ -2279,98 +2321,127 @@ export default function SimpleJob({
           </Card>
           <div className="mt-6">
             <Card
-              title="Character Likeness"
-              toggled={!!jobConfig.config.process[0].sample.likeness?.enabled}
+              title="Identity Eval"
+              toggled={!!identityEval?.enabled}
               onToggle={value => {
+                if (value && jobConfig.config.process[0].model.pipeline_sharding) return;
                 if (value) {
-                  setJobConfig(
-                    {
-                      enabled: true,
-                      reference_folder: jobConfig.config.process[0].sample.likeness?.reference_folder ?? '',
-                      comfyui_path: jobConfig.config.process[0].sample.likeness?.comfyui_path ?? '',
-                      device: 'cpu',
-                      samples: jobConfig.config.process[0].sample.likeness?.samples ?? [],
-                    },
-                    'config.process[0].sample.likeness',
-                  );
+                  setJobConfig({ ...(identityEval ?? {}), enabled: true }, 'config.process[0].identity_eval');
                 } else {
-                  setJobConfig(undefined, 'config.process[0].sample.likeness');
+                  setJobConfig(undefined, 'config.process[0].identity_eval');
                 }
               }}
             >
-              {jobConfig.config.process[0].sample.likeness?.enabled && (
+              {jobConfig.config.process[0].model.pipeline_sharding && (
+                <p className="text-sm text-yellow-500 mb-2">
+                  Identity eval is not available with multi-GPU pipeline sharding. Turn sharding off to use it.
+                </p>
+              )}
+              {identityEval?.enabled && (
                 <>
                   <p className="text-sm text-gray-400 mb-4">
-                    After every sample round, the samples are scored against reference images of the character for face,
-                    body shape and body detail likeness, by a ComfyUI install that has the character similarity nodes.
-                    Scoring runs in the background while training continues; scores are logged as likeness/* and saved
-                    to likeness/likeness_scores.csv with a report per step. Scoring prompts are rendered every round
-                    with fixed seeds so rounds compare directly; they should show the character&apos;s face and full
-                    body in the reference outfit. Leave them empty to score the regular samples.
+                    Renders fixed-seed face, body and flexibility prompts with the network off before training, then
+                    every eval round, and scores them against reference images: face, body and combined identity on a
+                    0-100 scale where 0 is the untrained model and 100 is how consistent the reference photos are with
+                    each other. While GPU scoring runs, the training model moves to system RAM and comes back after.
+                    Phase 0 uses a placeholder scorer, so the numbers do not measure identity yet.
                   </p>
                   <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
                     <TextInput
-                      label="Reference Images Folder"
-                      value={jobConfig.config.process[0].sample.likeness?.reference_folder ?? ''}
-                      onChange={value => setJobConfig(value, 'config.process[0].sample.likeness.reference_folder')}
-                      placeholder="eg. C:\\ai\\refs\\my_character"
-                      required
+                      label="Face Reference Images Folder"
+                      value={identityEval.face_references ?? ''}
+                      onChange={value => setJobConfig(value, 'config.process[0].identity_eval.face_references')}
+                      placeholder="empty = first dataset folder"
                     />
                     <TextInput
-                      label="ComfyUI Path"
-                      value={jobConfig.config.process[0].sample.likeness?.comfyui_path ?? ''}
-                      onChange={value => setJobConfig(value, 'config.process[0].sample.likeness.comfyui_path')}
-                      placeholder="eg. \\\\wsl.localhost\\Ubuntu-24.04\\home\\me\\ComfyUI"
-                      required
+                      label="Body Reference Images Folder"
+                      value={identityEval.body_references ?? ''}
+                      onChange={value => setJobConfig(value, 'config.process[0].identity_eval.body_references')}
+                      placeholder="empty = first dataset folder"
+                    />
+                    <TextInput
+                      label="Holdout Reference Images Folder"
+                      value={identityEval.holdout_references ?? ''}
+                      onChange={value => setJobConfig(value, 'config.process[0].identity_eval.holdout_references')}
+                      placeholder="optional: photos not used for training"
+                    />
+                    <TextInput
+                      label="SMPL-X Models Folder"
+                      value={identityEval.smplx_model_dir ?? ''}
+                      onChange={value => setJobConfig(value, 'config.process[0].identity_eval.smplx_model_dir')}
+                      placeholder="eg. C:\SMPL-X"
                     />
                     <SelectInput
-                      label="Scoring Device"
-                      value={jobConfig.config.process[0].sample.likeness?.device ?? 'cpu'}
-                      onChange={value => setJobConfig(value, 'config.process[0].sample.likeness.device')}
-                      options={[
-                        { value: 'cpu', label: 'CPU (keeps training GPUs free)' },
-                        { value: 'gpu', label: 'GPU (~12x faster, needs ~3.5 GB free)' },
-                      ]}
-                    />
-                    {jobConfig.config.process[0].sample.likeness?.device === 'gpu' && (
-                      <NumberInput
-                        label="Scoring GPU (index as in nvidia-smi, -1 = default)"
-                        value={jobConfig.config.process[0].sample.likeness?.gpu_index ?? -1}
-                        onChange={value => setJobConfig(value, 'config.process[0].sample.likeness.gpu_index')}
-                        min={-1}
-                      />
-                    )}
-                    <TextInput
-                      label="Overall Weights (face, body shape, body detail)"
-                      value={(jobConfig.config.process[0].sample.likeness?.weights ?? [1, 1, 1]).join(', ')}
+                      label="Face Scoring Device"
+                      value={`${identityEval.face_gpu ?? ''}`}
                       onChange={value =>
                         setJobConfig(
-                          value
-                            .split(',')
-                            .map((v: string) => parseFloat(v))
-                            .filter((v: number) => !isNaN(v)),
-                          'config.process[0].sample.likeness.weights',
+                          value === '' ? undefined : parseInt(value),
+                          'config.process[0].identity_eval.face_gpu',
                         )
                       }
-                      placeholder="1, 1, 1"
+                      options={scoringGpuOptions}
+                    />
+                    <SelectInput
+                      label="Body Scoring Device"
+                      value={`${identityEval.body_gpu ?? ''}`}
+                      onChange={value =>
+                        setJobConfig(
+                          value === '' ? undefined : parseInt(value),
+                          'config.process[0].identity_eval.body_gpu',
+                        )
+                      }
+                      options={scoringGpuOptions}
+                    />
+                    <NumberInput
+                      label="Eval Every N Sample Rounds"
+                      value={identityEval.eval_every ?? 1}
+                      onChange={value => setJobConfig(value, 'config.process[0].identity_eval.eval_every')}
+                      min={1}
+                    />
+                    <TextInput
+                      label="Evaluator Python"
+                      value={identityEval.evaluator_python ?? ''}
+                      onChange={value => setJobConfig(value, 'config.process[0].identity_eval.evaluator_python')}
+                      placeholder="empty = the toolkit's python"
                     />
                   </div>
-                  <div className="mt-4">
+                  <p className={`text-xs mt-2 ${scoringPausesTraining ? 'text-yellow-500' : 'text-emerald-400'}`}>
+                    {scoringPausesTraining
+                      ? `Training pauses for each scoring round: a scorer is on the training GPU (#${trainerGpu}). Set both scoring devices to another GPU or CPU to score in the background.`
+                      : 'Scoring runs in the background: training keeps going while each round is scored.'}
+                  </p>
+                  <p className="text-xs text-gray-500 mt-4">
+                    Prompt suites: one prompt per line, optionally prefixed with a pose bin as{' '}
+                    <code>front | prompt</code> (bins such as front, three_quarter, profile, side, back). Leave a suite
+                    empty to use the built-in prompts. Changing suites, references or the model after the first run
+                    invalidates the calibration.
+                  </p>
+                  <div className="grid grid-cols-1 gap-4 mt-2">
                     <TextAreaInput
-                      label="Scoring Prompts (one per line)"
-                      value={(jobConfig.config.process[0].sample.likeness?.samples ?? [])
-                        .map((s: any) => (typeof s === 'string' ? s : s.prompt))
-                        .join('\n')}
-                      onChange={value =>
-                        setJobConfig(
-                          value.split('\n').filter((line: string) => line.trim() !== ''),
-                          'config.process[0].sample.likeness.samples',
-                        )
-                      }
+                      label="Face Suite"
+                      value={suiteToText(identityEval.face_suite)}
+                      onChange={value => setJobConfig(textToSuite(value), 'config.process[0].identity_eval.face_suite')}
                       placeholder={
-                        'full body photo of [trigger] standing, front view, white background\nfull body photo of [trigger] standing, back view, white background'
+                        'front | close-up portrait photo of [trigger], looking at the camera, plain grey background\nprofile | close-up side profile portrait photo of [trigger], plain grey background'
                       }
-                      rows={4}
+                      rows={3}
+                    />
+                    <TextAreaInput
+                      label="Body Suite"
+                      value={suiteToText(identityEval.body_suite)}
+                      onChange={value => setJobConfig(textToSuite(value), 'config.process[0].identity_eval.body_suite')}
+                      placeholder={
+                        'front | full body photo of [trigger] standing, front view, fitted clothing, plain white studio background\nback | full body photo of [trigger] standing, back view, fitted clothing, plain white studio background'
+                      }
+                      rows={3}
+                    />
+                    <TextAreaInput
+                      label="Flexibility Suite"
+                      value={suiteToText(identityEval.flex_suite)}
+                      onChange={value => setJobConfig(textToSuite(value), 'config.process[0].identity_eval.flex_suite')}
+                      placeholder={'photo of [trigger] wearing a red raincoat, walking on a city street at night'}
+                      rows={3}
                     />
                   </div>
                 </>
