@@ -477,7 +477,7 @@ class ExampleModel(BaseModel):
         transformer: ExampleTransformer2DModel = unwrap_model(self.model)
         os.makedirs(os.path.join(output_path, "transformer"), exist_ok=True)
         state_dict = {
-            k: v.clone().to("cpu", dtype=save_dtype)
+            k: v.detach().to("cpu", dtype=save_dtype)
             for k, v in transformer.state_dict().items()
         }
         save_file(

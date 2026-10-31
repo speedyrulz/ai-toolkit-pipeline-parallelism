@@ -512,7 +512,8 @@ class TrainSliderProcess(BaseSDTrainProcess):
             all_pred = self.sd.predict_noise(
                 latents=torch.cat([denoised_latents] * 3, dim=0),
                 text_embeddings=embeddings,
-                timestep=torch.cat([current_timestep] * 3, dim=0),
+                # the prompt-only path draws a 0-dim timestep, which cannot be concatenated
+                timestep=torch.cat([current_timestep.reshape(-1)] * 3, dim=0),
             )
             all_pred = all_pred.detach()
             all_pred.requires_grad = False

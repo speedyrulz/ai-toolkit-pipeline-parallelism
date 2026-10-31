@@ -30,9 +30,10 @@ class FuyuImageProcessor:
         self.model = FuyuForCausalLM.from_pretrained(model_path, low_cpu_mem_usage=True, **kwargs)
         self.is_loaded = True
 
+        # the model and processor above are the ones used; a second 4-bit load
+        # here only orphaned the first copy, and FuyuProcessor(FuyuImageProcessor())
+        # picked up this module's wrapper class instead of transformers' processor
         self.tokenizer = AutoTokenizer.from_pretrained(model_path)
-        self.model = FuyuForCausalLM.from_pretrained(model_path, torch_dtype=self.dtype, **kwargs)
-        self.processor = FuyuProcessor(image_processor=FuyuImageProcessor(), tokenizer=self.tokenizer)
 
     def generate_caption(
             self, image: Image,

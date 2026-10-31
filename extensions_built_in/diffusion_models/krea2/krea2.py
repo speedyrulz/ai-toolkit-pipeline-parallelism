@@ -718,7 +718,7 @@ class Krea2Model(QwenImageVAEHolderMixin, BaseModel):
         for k, v in state_dict.items():
             # dequantize any quantized (e.g. quanto/torchao) weights so we save plain full precision tensors
             save_dict[k] = (
-                dequantize_if_quantized(v).clone().to("cpu", dtype=save_dtype)
+                dequantize_if_quantized(v).detach().to("cpu", dtype=save_dtype)
             )
         meta = get_meta_for_safetensors(meta, name="krea2")
         save_file(save_dict, output_path, metadata=meta)

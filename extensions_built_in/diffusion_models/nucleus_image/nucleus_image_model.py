@@ -113,7 +113,7 @@ class NucleusImageModel(QwenImageVAEHolderMixin, BaseModel):
 
         self.print_and_status_update("Loading VAE")
         vae = QwenImageVAE.load_model(
-            base_model_path, dtype=dtype, device=self.device_torch
+            base_model_path, dtype=dtype, device=self.vae_device_torch
         )
 
         self.noise_scheduler = NucleusImageModel.get_train_scheduler()
@@ -171,7 +171,7 @@ class NucleusImageModel(QwenImageVAEHolderMixin, BaseModel):
             transformer=unwrap_model(self.transformer),
         )
 
-        pipeline = pipeline.to(self.device_torch)
+        pipeline = self.move_pipeline_for_sampling(pipeline)
 
         return pipeline
 

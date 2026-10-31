@@ -494,7 +494,7 @@ class HidreamO1Model(BaseModel):
         # dequantize any quantized (e.g. torchao) weights so we save plain full precision tensors;
         # strip torch.compile's "._orig_mod." prefixes so the checkpoint loads into a fresh module
         save_dict = {
-            k.replace("._orig_mod.", "."): dequantize_if_quantized(v).clone().to("cpu", dtype=save_dtype)
+            k.replace("._orig_mod.", "."): dequantize_if_quantized(v).detach().to("cpu", dtype=save_dtype)
             for k, v in transformer.state_dict().items()
         }
         if self.is_comfy_weight:

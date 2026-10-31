@@ -21,7 +21,8 @@ def get_lr_scheduler(
             optimizer, **kwargs
         )
     elif name == "step":
-
+        # StepLR has no notion of a run length
+        kwargs.pop('total_iters', None)
         return torch.optim.lr_scheduler.StepLR(
             optimizer, **kwargs
         )
@@ -45,9 +46,16 @@ def get_lr_scheduler(
     else:
         # try to use a diffusers scheduler
         print(f"Trying to use diffusers scheduler {name}")
+        # the trainer passes the run length as total_iters; the diffusers
+        # schedules that take it call it num_training_steps
+        total_iters = kwargs.pop('total_iters', None)
         try:
+            import inspect
             name = SchedulerType(name)
             schedule_func = TYPE_TO_SCHEDULER_FUNCTION[name]
+            params = inspect.signature(schedule_func).parameters
+            if total_iters is not None and 'num_training_steps' in params and 'num_training_steps' not in kwargs:
+                kwargs['num_training_steps'] = total_iters
             return schedule_func(optimizer, **kwargs)
         except Exception as e:
             print(e)

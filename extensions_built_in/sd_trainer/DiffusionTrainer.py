@@ -99,7 +99,8 @@ class DiffusionTrainer(SDTrainer):
             self._async_tasks.append(asyncio.wrap_future(task))
         else:
             task = loop.create_task(coro)
-            self._async_tasks.append(task)
+            # runs to completion right here; tracking it would keep one finished
+            # task per step alive until the end of the run
             loop.run_until_complete(task)
 
     async def _execute_db_operation(self, operation_func):

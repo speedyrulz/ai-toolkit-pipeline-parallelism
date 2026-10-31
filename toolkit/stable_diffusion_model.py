@@ -185,10 +185,12 @@ class StableDiffusion:
         self.dtype = dtype
         self.torch_dtype = get_torch_dtype(dtype)
 
-        self.vae_device_torch = torch.device(device)
+        # model_config can pin the vae / text encoder to another gpu (e.g. keep
+        # them off the primary card when pipeline sharding fills it)
+        self.vae_device_torch = torch.device(model_config.vae_device or device)
         self.vae_torch_dtype = get_torch_dtype(model_config.vae_dtype)
 
-        self.te_device_torch = torch.device(device)
+        self.te_device_torch = torch.device(model_config.te_device or device)
         self.te_torch_dtype = get_torch_dtype(model_config.te_dtype)
 
         self.model_config = model_config
@@ -405,6 +407,8 @@ class StableDiffusion:
         load_args = {}
         # set by loaders that quantize the unet before it is placed below
         unet_is_quantized = False
+        # set when a loader fuses model_config.lora_path itself (before quantizing)
+        base_lora_fused = False
         if self.noise_scheduler:
             load_args['scheduler'] = self.noise_scheduler
 
@@ -462,6 +466,17 @@ class StableDiffusion:
                 te1_state_dict['text_projection.weight'] = replacement_weight.to(self.device_torch, dtype=dtype)
                 flush()
                 print_acc("Injecting alt weights")
+
+            if self.model_config.lora_path is not None and (
+                self.model_config.quantize or self.model_config.quantize_te
+            ):
+                # fuse the base lora BEFORE quantizing: peft merges into .weight,
+                # which on a quantized layer is a dequantized temporary that is
+                # thrown away, so a fuse after quantization is silently lost
+                pipe.load_lora_weights(self.model_config.lora_path, adapter_name="lora1")
+                pipe.fuse_lora()
+                pipe.unload_lora_weights()
+                base_lora_fused = True
 
             if self.model_config.quantize_te:
                 for i, te in enumerate(text_encoders):
@@ -1191,7 +1206,7 @@ class StableDiffusion:
             _adopt_v2(text_encoder)
 
         # load any loras we have
-        if self.model_config.lora_path is not None and not self.is_flux and not self.is_lumina2:
+        if self.model_config.lora_path is not None and not self.is_flux and not self.is_lumina2 and not base_lora_fused:
             pipe.load_lora_weights(self.model_config.lora_path, adapter_name="lora1")
             pipe.fuse_lora()
             # unfortunately, not an easier way with peft
@@ -3106,7 +3121,10 @@ class StableDiffusion:
                     'requires_grad': te_has_grad
                 })
         else:
-            if isinstance(self.text_encoder, T5EncoderModel) or isinstance(self.text_encoder, UMT5EncoderModel):
+            if isinstance(self.text_encoder, FakeTextEncoder):
+                # unloaded stub: nothing trainable left to probe
+                te_has_grad = False
+            elif isinstance(self.text_encoder, T5EncoderModel) or isinstance(self.text_encoder, UMT5EncoderModel):
                 te_has_grad = self.text_encoder.encoder.block[0].layer[0].SelfAttention.q.weight.requires_grad
             elif isinstance(self.text_encoder, Gemma2Model):
                 te_has_grad = self.text_encoder.layers[0].mlp.gate_proj.weight.requires_grad

@@ -416,7 +416,9 @@ def split_prompt_pairs(concatenated: EncodedPromptPair, num_embeds=None) -> List
 
 
 class PromptEmbedsCache:
-    prompts: dict[str, PromptEmbeds] = {}
+    def __init__(self):
+        # per instance: a class-level dict was shared by every cache in the process
+        self.prompts: dict[str, PromptEmbeds] = {}
 
     def __setitem__(self, __name: str, __value: PromptEmbeds) -> None:
         self.prompts[__name] = __value

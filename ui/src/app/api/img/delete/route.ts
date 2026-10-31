@@ -1,18 +1,20 @@
 import { NextResponse } from 'next/server';
 import fs from 'fs';
+import path from 'path';
 import { getDatasetsRoot, getTrainingFolder } from '@/server/settings';
 
 const fileExists = (p: string) => fs.promises.access(p).then(() => true).catch(() => false);
+const isInside = (p: string, root: string) => p === root || p.startsWith(root + path.sep);
 
 export async function POST(request: Request) {
   try {
     const body = await request.json();
-    const { imgPath } = body;
-    let datasetsPath = await getDatasetsRoot();
-    const trainingPath = await getTrainingFolder();
+    const datasetsPath = path.resolve(await getDatasetsRoot());
+    const trainingPath = path.resolve(await getTrainingFolder());
 
-    // make sure the dataset path is in the image path
-    if (!imgPath.startsWith(datasetsPath) && !imgPath.startsWith(trainingPath)) {
+    // resolve first: a raw prefix check lets `..` segments escape the allowed roots
+    const imgPath = typeof body.imgPath === 'string' ? path.resolve(body.imgPath) : '';
+    if (!imgPath || (!isInside(imgPath, datasetsPath) && !isInside(imgPath, trainingPath))) {
       return NextResponse.json({ error: 'Invalid image path' }, { status: 400 });
     }
 
@@ -30,7 +32,7 @@ export async function POST(request: Request) {
     await fs.promises.unlink(imgPath);
 
     // check for caption
-    const captionPath = imgPath.replace(/\.[^/.]+$/, '') + '.txt';
+    const captionPath = imgPath.replace(/\.[^/.\\]+$/, '') + '.txt';
     if (await fileExists(captionPath)) {
       // delete caption file
       await fs.promises.unlink(captionPath);

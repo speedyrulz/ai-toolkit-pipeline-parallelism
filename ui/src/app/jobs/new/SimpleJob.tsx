@@ -218,6 +218,15 @@ export default function SimpleJob({
   const suiteToText = (suite?: (string | { prompt: string; [key: string]: any })[]) =>
     (suite ?? []).map(s => (typeof s === 'string' ? s : s.bin ? `${s.bin} | ${s.prompt}` : s.prompt)).join('\n');
   const textToSuite = (value: string) => value.split('\n').filter((line: string) => line.trim() !== '');
+  // the suite textareas keep their raw text while typing: re-rendering the parsed
+  // list on every keystroke drops blank lines, so a trailing Enter would vanish
+  const [suiteDrafts, setSuiteDrafts] = useState<Record<string, string>>({});
+  const suiteValue = (key: string, suite?: (string | { prompt: string; [key: string]: any })[]) =>
+    suiteDrafts[key] ?? suiteToText(suite);
+  const editSuite = (key: string, value: string) => {
+    setSuiteDrafts(prev => ({ ...prev, [key]: value }));
+    setJobConfig(textToSuite(value), `config.process[0].identity_eval.${key}`);
+  };
 
   const [sampleLoraModalOpen, setSampleLoraModalOpen] = useState(false);
   const sampleLoras: SampleLora[] = jobConfig.config.process[0].sample.loras || [];
@@ -549,6 +558,10 @@ export default function SimpleJob({
                         // neither the sample helper nor identity eval runs with sharding
                         setJobConfig(undefined, 'config.process[0].sample.helper_gpu');
                         setJobConfig(undefined, 'config.process[0].identity_eval');
+                      } else {
+                        // the device list and balance belong to the sharding setup
+                        setJobConfig(undefined, 'config.process[0].model.pipeline_devices');
+                        setJobConfig(undefined, 'config.process[0].model.pipeline_balance');
                       }
                     }}
                     docKey="model.pipeline_sharding"
@@ -2420,8 +2433,8 @@ export default function SimpleJob({
                   <div className="grid grid-cols-1 gap-4 mt-2">
                     <TextAreaInput
                       label="Face Suite"
-                      value={suiteToText(identityEval.face_suite)}
-                      onChange={value => setJobConfig(textToSuite(value), 'config.process[0].identity_eval.face_suite')}
+                      value={suiteValue('face_suite', identityEval.face_suite)}
+                      onChange={value => editSuite('face_suite', value)}
                       placeholder={
                         'front | close-up portrait photo of [trigger], looking at the camera, plain grey background\nprofile | close-up side profile portrait photo of [trigger], plain grey background'
                       }
@@ -2429,8 +2442,8 @@ export default function SimpleJob({
                     />
                     <TextAreaInput
                       label="Body Suite"
-                      value={suiteToText(identityEval.body_suite)}
-                      onChange={value => setJobConfig(textToSuite(value), 'config.process[0].identity_eval.body_suite')}
+                      value={suiteValue('body_suite', identityEval.body_suite)}
+                      onChange={value => editSuite('body_suite', value)}
                       placeholder={
                         'front | full body photo of [trigger] standing, front view, fitted clothing, plain white studio background\nback | full body photo of [trigger] standing, back view, fitted clothing, plain white studio background'
                       }
@@ -2438,8 +2451,8 @@ export default function SimpleJob({
                     />
                     <TextAreaInput
                       label="Flexibility Suite"
-                      value={suiteToText(identityEval.flex_suite)}
-                      onChange={value => setJobConfig(textToSuite(value), 'config.process[0].identity_eval.flex_suite')}
+                      value={suiteValue('flex_suite', identityEval.flex_suite)}
+                      onChange={value => editSuite('flex_suite', value)}
                       placeholder={'photo of [trigger] wearing a red raincoat, walking on a city street at night'}
                       rows={3}
                     />

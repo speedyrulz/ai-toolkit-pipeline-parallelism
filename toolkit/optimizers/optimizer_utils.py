@@ -170,8 +170,10 @@ class Auto8bitTensor:
         if isinstance(data, dict):  # Add constructor from state dict
             self._load_from_state_dict(data)
         else:
-            abs_max = data.abs().max().item()
-            scale = abs_max / 127.0 if abs_max > 0 else 1.0
+            # keep the scale on the device as a 0-d tensor: a python float here
+            # would be a gpu->cpu sync for every state tensor on every step
+            abs_max = data.detach().abs().max().to(torch.float32)
+            scale = torch.where(abs_max > 0, abs_max / 127.0, torch.ones_like(abs_max))
 
             self.quantized = (data / scale).round().clamp(-127, 127).to(torch.int8)
             self.scale = scale
@@ -223,5 +225,7 @@ def stochastic_grad_accummulation(param):
         del grad_fp32
         del param.grad
     else:
-        param._accum_grad = param.grad.clone()
-        del param.grad
+        # take ownership of the fresh grad instead of cloning it; autograd
+        # allocates a new .grad on the next backward once this one is detached
+        param._accum_grad = param.grad
+        param.grad = None

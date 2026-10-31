@@ -21,7 +21,7 @@ def get_optimizer(
         if lower_type.endswith('lion'):
             optimizer = dadaptation.DAdaptLion(params, eps=1e-6, lr=use_lr, **optimizer_params)
         elif lower_type.endswith('adam'):
-            optimizer = dadaptation.DAdaptLion(params, eps=1e-6, lr=use_lr, **optimizer_params)
+            optimizer = dadaptation.DAdaptAdam(params, eps=1e-6, lr=use_lr, **optimizer_params)
         elif lower_type == 'dadaptation':
             # backwards compatibility
             optimizer = dadaptation.DAdaptAdam(params, eps=1e-6, lr=use_lr, **optimizer_params)

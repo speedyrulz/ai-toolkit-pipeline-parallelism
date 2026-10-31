@@ -83,7 +83,7 @@ class QwenImageEditPlusModel(QwenImageModel):
             transformer=unwrap_model(self.transformer),
         )
 
-        pipeline = pipeline.to(self.device_torch)
+        pipeline = self.move_pipeline_for_sampling(pipeline)
 
         return pipeline
 

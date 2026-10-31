@@ -208,7 +208,11 @@ class InferenceLoRA:
             alpha = parts.get("alpha")
             if alpha is not None:
                 e.alpha = float(alpha.flatten()[0])
-            w_shape = getattr(getattr(module, "weight", None), "shape", None)
+            if getattr(module, "is_ostris_quantized", False):
+                # .weight on a quantized linear dequantizes the whole matrix just to answer .shape
+                w_shape = (module.out_features, module.in_features)
+            else:
+                w_shape = getattr(getattr(module, "weight", None), "shape", None)
             if e.A is not None and e.B is not None and e.A.dim() == 2:
                 if w_shape is not None and (e.B.shape[0] != w_shape[0] or e.A.shape[1] != w_shape[1]):
                     self.unmatched.append(f"{base} (shape {tuple(e.B.shape[0:1]) + tuple(e.A.shape[1:])} vs {tuple(w_shape)})")
@@ -287,10 +291,35 @@ class InferenceLoRA:
     def attach(self):
         """Forward hooks that add strength * delta(x) to each module's output."""
         self.detach()
+        self._patched = []
         for e in self.entries:
-            hookable = (e.A is not None and e.A.dim() == 2) or e.kron_is_linear \
-                or e.diff is not None or e.diff_b is not None
+            m = e.module
+            is_embedding = isinstance(m, torch.nn.Embedding)
+            # what the forward hook can apply: 2-d lora / linear lokr factors and
+            # 2-d full diffs (plus a bias diff) on a module whose last output dim
+            # is the feature dim
+            hookable = (
+                (e.A is not None and e.A.dim() == 2)
+                or e.kron_is_linear
+                or (e.diff is not None and e.diff.dim() == 2 and not is_embedding)
+                or (e.diff_b is not None and e.diff is None and e.A is None and e.kron is None and not is_embedding)
+            )
+            if (e.A is not None and e.A.dim() != 2) or (e.diff is not None and e.diff.dim() != 2) or is_embedding:
+                hookable = False
             if not hookable:
+                # norm / conv / embedding deltas cannot ride a forward hook: patch
+                # the weights in place and put them back in detach()
+                w = getattr(m, "weight", None)
+                if w is None or getattr(m, "is_ostris_quantized", False) or not isinstance(w, torch.Tensor):
+                    continue
+                dw, db = e.delta(self.strength, w.device)
+                if dw is not None and dw.numel() == w.numel():
+                    self._patched.append((w, w.data.clone()))
+                    w.data.add_(dw.reshape(w.shape).to(w.dtype))
+                b = getattr(m, "bias", None)
+                if db is not None and b is not None and db.numel() == b.numel():
+                    self._patched.append((b, b.data.clone()))
+                    b.data.add_(db.reshape(b.shape).to(b.dtype))
                 continue
             lora = self
 
@@ -357,6 +386,9 @@ class InferenceLoRA:
         for h in self._hooks:
             h.remove()
         self._hooks = []
+        for t, orig in getattr(self, "_patched", []):
+            t.data.copy_(orig)
+        self._patched = []
 
     # ---- merge mode ----
     @torch.no_grad()

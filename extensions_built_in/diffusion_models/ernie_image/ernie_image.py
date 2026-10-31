@@ -103,7 +103,7 @@ class ErnieImageModel(BaseModel):
 
         self.print_and_status_update("Loading VAE")
         vae = Flux2KLVAE.load_model(            base_model_path, dtype=dtype
-        ).to(self.device_torch, dtype=dtype)
+        ).to(self.vae_device_torch, dtype=dtype)
 
         self.noise_scheduler = ErnieImageModel.get_train_scheduler()
 
@@ -160,13 +160,13 @@ class ErnieImageModel(BaseModel):
             transformer=unwrap_model(self.transformer),
         )
 
-        pipeline = pipeline.to(self.device_torch)
+        pipeline = self.move_pipeline_for_sampling(pipeline)
 
         return pipeline
 
     def encode_images(self, image_list: List[torch.Tensor], device=None, dtype=None):
         if self.vae.device == torch.device("cpu"):
-            self.vae.to(self.device_torch)
+            self.vae.to(self.vae_device_torch)
         if device is None:
             device = self.vae_device_torch
         if dtype is None:
@@ -178,7 +178,8 @@ class ErnieImageModel(BaseModel):
         if isinstance(image, list):
             image = torch.stack(image, dim=0)
 
-        image = image.to(device, dtype=dtype)
+        # encode on the vae's own device; `device` is where the latents go back
+        image = image.to(self.vae.device, dtype=dtype)
 
         latents = self.vae.encode(image).latent_dist.sample()
 
@@ -192,19 +193,21 @@ class ErnieImageModel(BaseModel):
         )
         latents = (latents - bn_mean) / bn_std
 
-        return latents
+        return latents.to(device)
 
     def decode_latents(self, latents: torch.Tensor, device=None, dtype=None):
         if self.vae.device == torch.device("cpu"):
-            self.vae.to(self.device_torch)
+            self.vae.to(self.vae_device_torch)
         if device is None:
             device = self.vae_device_torch
         if dtype is None:
             dtype = self.vae_torch_dtype
 
-        latents = latents.to(device, dtype=dtype)
-        bn_mean = self.vae.bn.running_mean.view(1, -1, 1, 1).to(device)
-        bn_std = torch.sqrt(self.vae.bn.running_var.view(1, -1, 1, 1) + 1e-5).to(device)
+        # decode on the vae's own device; `device` is where the images go back
+        vae_device = self.vae.device
+        latents = latents.to(vae_device, dtype=dtype)
+        bn_mean = self.vae.bn.running_mean.view(1, -1, 1, 1).to(vae_device)
+        bn_std = torch.sqrt(self.vae.bn.running_var.view(1, -1, 1, 1) + 1e-5).to(vae_device)
         latents = latents * bn_std + bn_mean
 
         # Unpatchify
@@ -212,7 +215,7 @@ class ErnieImageModel(BaseModel):
 
         # Decode
         images = self.vae.decode(latents, return_dict=False)[0]
-        return images
+        return images.to(device)
 
     def generate_single_image(
         self,

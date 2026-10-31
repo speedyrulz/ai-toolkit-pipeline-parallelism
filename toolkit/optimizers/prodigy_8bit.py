@@ -152,6 +152,10 @@ class Prodigy8bit(Optimizer):
 
         d_numerator = group['d_numerator']
         d_numerator *= beta3
+        # per-parameter terms accumulate on the device; one sync after the loop
+        # instead of two .item() calls per parameter
+        d_numerator_acc = None
+        d_denom_acc = None
 
         for group in self.param_groups:
             decay = group['weight_decay']
@@ -201,8 +205,8 @@ class Prodigy8bit(Optimizer):
 
                 if group_lr > 0.0:
                     # we use d / d0 instead of just d to avoid getting values that are too small
-                    d_numerator += (d / d0) * dlr * torch.dot(grad.flatten(),
-                                                              (p0.data - p_fp32.data).flatten()).item()
+                    num_term = (d / d0) * dlr * torch.dot(grad.flatten(), (p0.data - p_fp32.data).flatten())
+                    d_numerator_acc = num_term if d_numerator_acc is None else d_numerator_acc + num_term.to(d_numerator_acc.device)
 
                     # Adam EMA updates
                     exp_avg.mul_(beta1).add_(grad, alpha=d * (1-beta1))
@@ -213,13 +217,19 @@ class Prodigy8bit(Optimizer):
                         s.mul_(beta3).add_(grad, alpha=((d / d0) * d))
                     else:
                         s.mul_(beta3).add_(grad, alpha=((d / d0) * dlr))
-                    d_denom += s.abs().sum().item()
+                    den_term = s.abs().sum()
+                    d_denom_acc = den_term if d_denom_acc is None else d_denom_acc + den_term.to(d_denom_acc.device)
 
-                # update state with stochastic rounding
+                # update state with stochastic rounding. p0 (the initial
+                # weights) never changes, so it is not requantized every step
                 state['exp_avg'] = Auto8bitTensor(exp_avg)
                 state['exp_avg_sq'] = Auto8bitTensor(exp_avg_sq)
                 state['s'] = Auto8bitTensor(s)
-                state['p0'] = Auto8bitTensor(p0)
+
+        if d_numerator_acc is not None:
+            d_numerator += float(d_numerator_acc)
+        if d_denom_acc is not None:
+            d_denom += float(d_denom_acc)
 
         d_hat = d
 

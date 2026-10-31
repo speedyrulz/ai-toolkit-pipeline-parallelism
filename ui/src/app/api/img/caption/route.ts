@@ -1,14 +1,18 @@
 import { NextResponse } from 'next/server';
 import fs from 'fs';
+import path from 'path';
 import { getDatasetsRoot } from '@/server/settings';
+
+const isInside = (p: string, root: string) => p === root || p.startsWith(root + path.sep);
 
 export async function POST(request: Request) {
   try {
     const body = await request.json();
-    const { imgPath, caption, ext } = body;
-    let datasetsPath = await getDatasetsRoot();
-    // make sure the dataset path is in the image path
-    if (!imgPath.startsWith(datasetsPath)) {
+    const { caption, ext } = body;
+    const datasetsPath = path.resolve(await getDatasetsRoot());
+    // resolve first: a raw prefix check lets `..` segments escape the datasets root
+    const imgPath = typeof body.imgPath === 'string' ? path.resolve(body.imgPath) : '';
+    if (!imgPath || !isInside(imgPath, datasetsPath)) {
       return NextResponse.json({ error: 'Invalid image path' }, { status: 400 });
     }
 
@@ -19,9 +23,12 @@ export async function POST(request: Request) {
       return NextResponse.json({ error: 'Image does not exist' }, { status: 404 });
     }
 
-    // check for caption (default extension txt)
+    // check for caption (default extension txt); the extension is caller supplied
     const captionExt = ((ext || 'txt') as string).replace(/^\.+/, '').trim() || 'txt';
-    const captionPath = imgPath.replace(/\.[^/.]+$/, '') + '.' + captionExt;
+    if (!/^[a-z0-9]{1,10}$/i.test(captionExt)) {
+      return NextResponse.json({ error: 'Invalid caption extension' }, { status: 400 });
+    }
+    const captionPath = imgPath.replace(/\.[^/.\\]+$/, '') + '.' + captionExt;
     // save caption to file
     await fs.promises.writeFile(captionPath, caption);
 

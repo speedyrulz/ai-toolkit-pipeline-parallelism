@@ -386,7 +386,7 @@ class BooguImageModel(BaseModel):
         for k, v in state_dict.items():
             if isinstance(v, QTensor):
                 v = v.dequantize()
-            save_dict[k] = v.clone().to("cpu", dtype=save_dtype)
+            save_dict[k] = v.detach().to("cpu", dtype=save_dtype)
         save_file(
             save_dict,
             os.path.join(transformer_dir, "diffusion_pytorch_model.safetensors"),

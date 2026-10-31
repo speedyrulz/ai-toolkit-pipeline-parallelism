@@ -215,7 +215,7 @@ class Flex2(BaseModel):
             transformer=unwrap_model(self.transformer)
         )
 
-        pipeline = pipeline.to(self.device_torch)
+        pipeline = self.move_pipeline_for_sampling(pipeline)
 
         return pipeline
 
@@ -513,9 +513,13 @@ class Flex2(BaseModel):
 
                 control_tensor = control_tensor.to(self.vae_device_torch, dtype=self.torch_dtype)
                 
-                # if it is not the size of batch.tensor, (bs,ch,h,w) then we need to resize it
-                if control_tensor.shape[2] != batch.tensor.shape[2] or control_tensor.shape[3] != batch.tensor.shape[3]:
-                    control_tensor = F.interpolate(control_tensor, size=(batch.tensor.shape[2], batch.tensor.shape[3]), mode='bilinear')
+                # resize to the training image size (batch.tensor is None when latents are cached)
+                if batch.tensor is not None:
+                    target_h, target_w = batch.tensor.shape[2], batch.tensor.shape[3]
+                else:
+                    target_h, target_w = batch.file_items[0].crop_height, batch.file_items[0].crop_width
+                if control_tensor.shape[2] != target_h or control_tensor.shape[3] != target_w:
+                    control_tensor = F.interpolate(control_tensor, size=(target_h, target_w), mode='bilinear')
                 
                 # encode it
                 control_latent = self.encode_images(control_tensor).to(latents.device, latents.dtype)

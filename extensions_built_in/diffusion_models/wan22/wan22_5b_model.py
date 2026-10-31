@@ -139,7 +139,7 @@ class Wan225bModel(Wan21):
             aggressive_offload=self.model_config.low_vram,
         )
 
-        pipeline = pipeline.to(self.device_torch)
+        pipeline = self.move_pipeline_for_sampling(pipeline)
 
         return pipeline
 

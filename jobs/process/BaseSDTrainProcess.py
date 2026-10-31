@@ -457,9 +457,16 @@ class BaseSDTrainProcess(BaseTrainProcess):
         embedding in sample_prompts_cache or the identity prompt cache)."""
         use_helper = self._helper_usable(sample_config)
         main_items, helper_items = [], []
+        # placeholders resolve per list (and per process for the helper), so bake
+        # one shared time stamp and the zero-padded image index in now: the
+        # samples grid sorts by file name
+        round_time = str(int(time.time() * 1000))
+        count_width = len(str(len(items)))
         for item in items:
-            # placeholders resolve per list, so bake the image index in now
-            item['output_path'] = item['output_path'].replace('[count]', str(len(main_items) + len(helper_items)))
+            idx = len(main_items) + len(helper_items)
+            item['output_path'] = (
+                item['output_path'].replace('[count]', str(idx).zfill(count_width)).replace('[time]', round_time)
+            )
             on_helper = (
                 use_helper
                 and item['_renderer'] == 'helper'
@@ -487,28 +494,48 @@ class BaseSDTrainProcess(BaseTrainProcess):
             self.sample_helper.render_async(strip, lora_path, sample_config.sampler, sample_config.loras,
                                             scheduler=sample_config.scheduler)
 
+        helper_error = None
         try:
             if main_items:
-                configs = [
-                    GenerateImageConfig(**{k: v for k, v in i.items() if not k.startswith('_')}, logger=self.logger)
-                    for i in main_items
-                ]
-                configs = self.post_process_generate_image_config_list(configs)
-                regular_cache = self.sd.sample_prompts_cache
-                swap = regular_cache is not None and (
-                    helper_items or any(not i['_cache_key'].startswith('sample:') for i in main_items)
-                )
-                if swap:
-                    # generate_images reads cached embeddings by list index
-                    self.sd.sample_prompts_cache = [self._cached_embeds(i['_cache_key'], regular_cache) for i in main_items]
-                try:
-                    self.sd.generate_images(configs, sampler=sample_config.sampler, scheduler=sample_config.scheduler)
-                finally:
-                    if swap:
-                        self.sd.sample_prompts_cache = regular_cache
+                self._render_main_items(main_items, sample_config, swap_cache=bool(helper_items))
         finally:
             if helper_items:
-                self.sample_helper.render_wait()
+                from toolkit.identity_eval.proc import ChildError
+                try:
+                    self.sample_helper.render_wait()
+                except ChildError as e:
+                    helper_error = e
+        if helper_error is not None:
+            # a helper-side failure (oom on the second card, a stale network
+            # snapshot, ...) must not end the training run: render its share on
+            # the trainer's gpu and carry on without the helper
+            print_acc(f"Sample helper failed ({helper_error}); rendering its {len(helper_items)} image(s) "
+                      "on the trainer's gpu and continuing without it")
+            try:
+                self.sample_helper.close()
+            except Exception:
+                pass
+            self.sample_helper = None
+            self._render_main_items(helper_items, sample_config, swap_cache=True)
+
+    def _render_main_items(self, main_items, sample_config, swap_cache: bool):
+        configs = [
+            GenerateImageConfig(**{k: v for k, v in i.items() if not k.startswith('_')}, logger=self.logger)
+            for i in main_items
+        ]
+        configs = self.post_process_generate_image_config_list(configs)
+        regular_cache = self.sd.sample_prompts_cache
+        swap = regular_cache is not None and (
+            swap_cache or any(not i['_cache_key'].startswith('sample:') for i in main_items)
+        )
+        if swap:
+            # generate_images reads cached embeddings by list index
+            self.sd.sample_prompts_cache = [self._cached_embeds(i['_cache_key'], regular_cache) for i in main_items]
+        try:
+            self.sd.generate_images(configs, sampler=sample_config.sampler, scheduler=sample_config.scheduler)
+        finally:
+            if swap:
+                self.sd.sample_prompts_cache = regular_cache
 
     def _cached_embeds(self, key, regular_cache):
         kind, _, ref = key.partition(':')
@@ -556,7 +583,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
         parameters and optimizer state stay on the gpu."""
         t0 = time.time()
         if self.sample_helper is not None:
-            self.sample_helper.offload()
+            self._helper_call('offload')
         self.sd.set_device_state_preset('unload')
         saved_state = self.sd.device_state
         flush()
@@ -565,7 +592,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
         finally:
             self.sd.restore_device_state()
             if self.sample_helper is not None:
-                self.sample_helper.onload()
+                self._helper_call('onload')
             unet_device = next(self.sd.unet.parameters()).device
             want = torch.device(saved_state['unet']['device'])
             if unet_device.type != want.type or (want.index is not None and unet_device.index != want.index):
@@ -573,6 +600,20 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     f"identity eval: the training model did not return to {want} after scoring (it is on {unet_device})"
                 )
             print_acc(f"Identity eval: gpu hand-off and reload took {time.time() - t0:.0f}s in total")
+
+    def _helper_call(self, method: str):
+        """Run a sample helper request; a helper failure drops the helper
+        (sampling stays on the trainer's gpu) instead of ending training."""
+        from toolkit.identity_eval.proc import ChildError
+        try:
+            getattr(self.sample_helper, method)()
+        except ChildError as e:
+            print_acc(f"Sample helper {method} failed ({e}); continuing without the sample helper")
+            try:
+                self.sample_helper.close()
+            except Exception:
+                pass
+            self.sample_helper = None
 
     def _identity_start(self):
         """Start the sample helper and identity eval before the first sample."""
@@ -1113,7 +1154,11 @@ class BaseSDTrainProcess(BaseTrainProcess):
         # placement done at network creation time; put every adapter module back
         # on the device of the layer it wraps. The unet itself is protected by
         # the shard manager's .to() override.
-        if self.sd.unet is not None and hasattr(unwrap_model(self.sd.unet), "_shard_manager"):
+        _needs_align = self.sd.unet is not None and hasattr(unwrap_model(self.sd.unet), "_shard_manager")
+        if not _needs_align and self.train_config.train_text_encoder and not self.model_config.layer_offloading:
+            # a text encoder pinned to te_device keeps its adapters with it
+            _needs_align = torch.device(self.sd.te_device_torch) != torch.device(self.sd.device_torch)
+        if _needs_align:
             from toolkit.pipeline_sharding import PipelineShardManager
             if self.sd.network is not None:
                 PipelineShardManager.align_network(unwrap_model(self.sd.network))
@@ -1294,7 +1339,9 @@ class BaseSDTrainProcess(BaseTrainProcess):
         schedule_timesteps = self.sd.noise_scheduler.timesteps.to(self.device)
         timesteps = timesteps.to(self.device)
 
-        step_indices = [(schedule_timesteps == t).nonzero().item() for t in timesteps]
+        # index of each timestep in the schedule, as one gather (a .nonzero().item()
+        # per element is a gpu sync each)
+        step_indices = (schedule_timesteps[None, :] == timesteps[:, None]).int().argmax(dim=1)
 
         sigma = sigmas[step_indices].flatten()
         while len(sigma.shape) < n_dim:
@@ -1506,9 +1553,11 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 num_train_timesteps = self.train_config.num_train_timesteps
 
                 if self.train_config.noise_scheduler in ['custom_lcm']:
-                    # we store this value on our custom one
+                    # we store this value on our custom one. Training uses the
+                    # full schedule, so it is also the "original" step count
                     self.sd.noise_scheduler.set_timesteps(
-                        self.sd.noise_scheduler.train_timesteps, device=self.device_torch
+                        self.sd.noise_scheduler.train_timesteps, device=self.device_torch,
+                        original_inference_steps=self.sd.noise_scheduler.train_timesteps,
                     )
                 elif self.train_config.noise_scheduler in ['lcm']:
                     self.sd.noise_scheduler.set_timesteps(
@@ -2572,7 +2621,11 @@ class BaseSDTrainProcess(BaseTrainProcess):
         elif text_encoder is not None:
             text_encoder.requires_grad_(False)
             text_encoder.eval()
-        unet.to(self.device_torch, dtype=dtype)
+        if getattr(unwrap_model(unet), 'aitk_cast_on_load', True):
+            unet.to(self.device_torch, dtype=dtype)
+        else:
+            # the loader owns this model's precision (fp32 islands): device only
+            unet.to(self.device_torch)
         unet.requires_grad_(False)
         unet.eval()
         if vae is not None:
@@ -2672,6 +2725,14 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 if unet is not None and hasattr(unet, "_shard_manager"):
                     # pipeline-sharded model: adapter modules must live on the
                     # device of the layer they wrap, not the force_to device
+                    from toolkit.pipeline_sharding import PipelineShardManager
+                    PipelineShardManager.align_network(self.network)
+                elif (
+                    self.train_config.train_text_encoder
+                    and not self.model_config.layer_offloading
+                    and torch.device(self.sd.te_device_torch) != torch.device(self.sd.device_torch)
+                ):
+                    # text encoder pinned to te_device: its adapters follow it
                     from toolkit.pipeline_sharding import PipelineShardManager
                     PipelineShardManager.align_network(self.network)
 
@@ -2863,6 +2924,18 @@ class BaseSDTrainProcess(BaseTrainProcess):
         optimizer = get_optimizer(self.params, optimizer_type, learning_rate=self.train_config.lr,
                                   optimizer_params=self.train_config.optimizer_params)
         self.optimizer = optimizer
+        # fused optimizers (automagic2, automagic3/4 with fused=True, ...) apply
+        # the update inside the backward hook of every micro-batch, so gradient
+        # accumulation and max_grad_norm have no effect on them
+        _is_fused = type(optimizer).__name__ == 'Automagic2' or bool(getattr(optimizer, 'fused', False))
+        if _is_fused and (
+            self.train_config.gradient_accumulation > 1 or self.train_config.gradient_accumulation_steps != 1
+        ):
+            print_acc(
+                f"WARNING: optimizer {optimizer_type} updates the weights inside the backward pass, so "
+                "gradient accumulation is not applied: every micro-batch is its own optimizer step and "
+                "max_grad_norm is not enforced. Use a non-fused optimizer to accumulate gradients."
+            )
         
         # set it to do paramiter swapping
         if self.train_config.do_paramiter_swapping:
@@ -2914,7 +2987,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
         lr_scheduler_params = self.train_config.lr_scheduler_params
 
         # make sure it had bare minimum
-        if 'max_iterations' not in lr_scheduler_params:
+        if 'total_iters' not in lr_scheduler_params:
             lr_scheduler_params['total_iters'] = self.train_config.steps
 
         lr_scheduler = get_lr_scheduler(
@@ -3301,9 +3374,9 @@ class BaseSDTrainProcess(BaseTrainProcess):
 
                 batch_list = []
 
+                # keep track to alternate on an accumulation step for reg
+                batch_step = step
                 for b in range(self.train_config.gradient_accumulation):
-                    # keep track to alternate on an accumulation step for reg   
-                    batch_step = step
                     # don't do a reg step on sample or save steps as we dont want to normalize on those
                     if batch_step % 2 == 0 and dataloader_reg is not None and not is_save_step and not is_sample_step:
                         try:
@@ -3377,6 +3450,11 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 if self.num_consecutive_oom > 3:
                     raise RuntimeError("OOM during training step 3 times in a row, aborting training")
                 optimizer.zero_grad(set_to_none=True)
+                # stochastic grad accumulation parks partial grads outside .grad
+                for _group in optimizer.param_groups:
+                    for _p in _group['params']:
+                        if hasattr(_p, '_accum_grad'):
+                            del _p._accum_grad
                 flush()
                 torch.cuda.ipc_collect()
                 # skip this step and keep going
@@ -3445,12 +3523,20 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     if self.progress_bar is not None:
                         self.progress_bar.set_postfix_str(prog_bar_string)
 
-                # if the batch is a DataLoaderBatchDTO, then we need to clean it up
-                # (adaptive lr owns its buffered batches and cleans them at
-                # segment end, so they stay replayable)
-                if isinstance(batch, DataLoaderBatchDTO) and not self._alr_active():
-                    with self.timer('batch_cleanup'):
-                        batch.cleanup()
+                # clean up every micro-batch of this step, not just the last one
+                with self.timer('batch_cleanup'):
+                    for _b in batch_list:
+                        if not isinstance(_b, DataLoaderBatchDTO):
+                            continue
+                        if self._alr_active():
+                            # adaptive lr owns its buffered batches and cleans them
+                            # at segment end so they stay replayable; park their
+                            # device latents on the cpu meanwhile (the replay's
+                            # process_general_training_batch re-uploads them)
+                            if _b.latents is not None and _b.latents.device.type != 'cpu':
+                                _b.latents = _b.latents.to('cpu')
+                        else:
+                            _b.cleanup()
 
                 # don't do on first step
                 if self.step_num != self.start_step:
@@ -3521,10 +3607,11 @@ class BaseSDTrainProcess(BaseTrainProcess):
                             self.logger.log({
                                 'learning_rate': learning_rate,
                             })
-                            for key, value in loss_dict.items():
-                                self.logger.log({
-                                    f'loss/{key}': value,
-                                })
+                            if loss_dict is not None:
+                                for key, value in loss_dict.items():
+                                    self.logger.log({
+                                        f'loss/{key}': value,
+                                    })
                             if self.additional_logs is not None:
                                 for key, value in self.additional_logs.items():
                                     self.logger.log({

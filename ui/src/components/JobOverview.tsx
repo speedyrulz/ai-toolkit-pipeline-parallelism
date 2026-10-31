@@ -29,13 +29,21 @@ export default function JobOverview({ job }: JobOverviewProps) {
     job.gpu_ids.split(',').forEach(id => add(parseInt(id), 'training'));
     try {
       const process = getJobConfig(job).config.process[0];
+      const trainer = parseInt(job.gpu_ids.split(',')[0]);
+      const model = process.model as any;
+      if (model?.pipeline_sharding) {
+        ((model.pipeline_devices as string[] | undefined) ?? []).forEach((d: string) => {
+          const id = parseInt(d.split(':')[1]);
+          if (!roles.has(id)) add(id, 'pipeline shard');
+        });
+      }
       const helper = process.sample?.helper_gpu;
       add(helper, 'sample helper');
       const ie = process.identity_eval;
       if (ie?.enabled) {
         // unset scorers follow the coordinator defaults: face on the trainer's card, body on the helper's
-        add(ie.face_gpu ?? undefined, 'face scoring');
-        add(ie.body_gpu ?? helper ?? undefined, 'body scoring');
+        add(ie.face_gpu ?? trainer, 'face scoring');
+        add(ie.body_gpu ?? helper ?? trainer, 'body scoring');
       }
     } catch {}
     return roles;

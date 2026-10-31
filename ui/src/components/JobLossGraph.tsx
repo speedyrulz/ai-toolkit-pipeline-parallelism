@@ -263,9 +263,12 @@ export default function JobLossGraph({ job }: Props) {
     const stepSet = new Set<number>();
     for (const key of activeKeys) {
       const pts: LossPoint[] = series[key] ?? [];
+      // identity scores live on their own linear 0-100 scale: a 0 (the step-0
+      // baseline) is a real point even when the loss axis is logarithmic
+      const identityScore = IDENTITY_SCORES.has(key);
       for (const p of pts) {
         if (p.value === null || !Number.isFinite(p.value as number)) continue;
-        if (useLogScale && (p.value as number) <= 0) continue;
+        if (useLogScale && !identityScore && (p.value as number) <= 0) continue;
         stepSet.add(p.step);
       }
     }
@@ -312,7 +315,9 @@ export default function JobLossGraph({ job }: Props) {
       // markers (auto-shown when points are far apart, incl. isolated ones).
       const sparse = map.size < xs.length;
       sparseFlags.push(sparse);
-      const smooth = emaWithNulls(raw, alpha);
+      // identity scores are calibrated per-round aggregates (a handful of sparse
+      // points); smoothing them would blend neighbouring rounds into wrong values
+      const smooth = identityScore ? raw : emaWithNulls(raw, alpha);
       const fullSmooth = emaWithNulls(raw, fullAlpha);
 
       const color = colorByKey[key] ?? PALETTE[0];
@@ -333,7 +338,7 @@ export default function JobLossGraph({ job }: Props) {
       });
       colArrays.push(smooth);
 
-      if (showTrend) {
+      if (showTrend && !identityScore) {
         data.push(fullSmooth);
         seriesConfigs.push({
           label: `${key} (trend)`,

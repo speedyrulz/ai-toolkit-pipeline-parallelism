@@ -484,8 +484,10 @@ class ZImageL2PModel(ZImageModel):
             pipe.transformer = pipe.transformer.to(self.device_torch)
 
         flush()
-        # just to make sure everything is on the right device and dtype
-        text_encoder[0].to(self.device_torch)
+        # just to make sure everything is on the right device and dtype (the
+        # loader parks it on the cpu under low_vram; get_prompt_embeds moves it up)
+        if not self.low_vram:
+            text_encoder[0].to(self.te_device_torch)
         text_encoder[0].requires_grad_(False)
         text_encoder[0].eval()
         flush()

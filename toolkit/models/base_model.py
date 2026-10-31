@@ -357,6 +357,19 @@ class BaseModel:
         raise NotImplementedError(
             "load_model must be implemented in child classes")
 
+    def move_pipeline_for_sampling(self, pipeline):
+        """Place a freshly built sampling pipeline. `pipeline.to(device)` would
+        also drag a text encoder pinned to te_device onto the primary card,
+        although the prompts are already encoded by the time the pipeline runs;
+        with a separate te_device only the denoiser and the vae move."""
+        if torch.device(self.te_device_torch) == torch.device(self.device_torch):
+            return pipeline.to(self.device_torch)
+        for name in ('transformer', 'unet', 'vae'):
+            component = getattr(pipeline, name, None)
+            if component is not None and hasattr(component, 'to'):
+                component.to(self.device_torch)
+        return pipeline
+
     def get_generation_pipeline(self):
         # override this in child classes
         raise NotImplementedError(
@@ -807,7 +820,12 @@ class BaseModel:
             network.train()
             network.multiplier = start_multiplier
 
-        self.unet.to(self.device_torch, dtype=self.torch_dtype)
+        if getattr(unwrap_model(self.unet), 'aitk_cast_on_load', True):
+            self.unet.to(self.device_torch, dtype=self.torch_dtype)
+        else:
+            # the loader keeps deliberate fp32 islands (e.g. MiniMax-H3's rope
+            # table and embedders); a whole-model dtype cast would flatten them
+            self.unet.to(self.device_torch)
         if network.is_merged_in:
             network.merge_out(merge_multiplier)
         # self.tokenizer.to(original_device_dict['tokenizer'])
@@ -1227,11 +1245,13 @@ class BaseModel:
         latent_list = []
         # Move to vae to device if on cpu
         if self.vae.device == torch.device("cpu"):
-            self.vae.to(device)
+            self.vae.to(self.vae_device_torch)
         self.vae.eval()
         self.vae.requires_grad_(False)
-        # move to device and dtype
-        image_list = [image.to(device, dtype=dtype) for image in image_list]
+        # the vae computes on its own device (it may be pinned to vae_device);
+        # `device` is where the latents are handed back
+        vae_device = self.vae.device
+        image_list = [image.to(vae_device, dtype=dtype) for image in image_list]
 
         VAE_SCALE_FACTOR = 2 ** (
             len(self.vae.config['block_out_channels']) - 1)
@@ -1243,7 +1263,7 @@ class BaseModel:
                 image_list[i] = Resize((image.shape[1] // VAE_SCALE_FACTOR * VAE_SCALE_FACTOR,
                                         image.shape[2] // VAE_SCALE_FACTOR * VAE_SCALE_FACTOR))(image)
 
-        images = torch.stack(image_list).to(device, dtype=dtype)
+        images = torch.stack(image_list).to(vae_device, dtype=dtype)
         if isinstance(self.vae, AutoencoderTiny):
             latents = self.vae.encode(images, return_dict=False)[0]
         else:
@@ -1274,8 +1294,10 @@ class BaseModel:
 
         # Move to vae to device if on cpu
         if self.vae.device == torch.device('cpu'):
-            self.vae.to(self.device)
-        latents = latents.to(device, dtype=dtype)
+            self.vae.to(self.vae_device_torch)
+        # decode on the vae's own device (it may be pinned to vae_device) and
+        # hand the images back on `device`
+        latents = latents.to(self.vae.device, dtype=dtype)
         latents = (
             latents / self.vae.config['scaling_factor']) + self.vae.config['shift_factor']
         images = self.vae.decode(latents).sample

@@ -735,8 +735,9 @@ class SDTrainer(BaseSDTrainProcess):
                 else:
                     dopsd_normal_target = noise
         elif self.sd.prediction_type == 'v_prediction':
-            # v-parameterization training
-            target = self.sd.noise_scheduler.get_velocity(batch.tensor, noise, timesteps)
+            # v-parameterization training (the velocity is defined in latent
+            # space; batch.tensor is pixels, or None with cached latents)
+            target = self.sd.noise_scheduler.get_velocity(batch.latents, noise, timesteps)
         elif self.train_config.do_signal_amplification:
             if not self.sd.is_flow_matching:
                 raise ValueError("Signal amplification is only supported for flow matching models")
@@ -1343,7 +1344,7 @@ class SDTrainer(BaseSDTrainProcess):
         
         
         time_gap = (t_frac - r_frac)[:, None, None, None].to(dtype)
-        time_gap.clamp(min=1e-4)
+        time_gap = time_gap.clamp(min=1e-4)
         u_shifted = u_pred + time_gap * du_dt
         # u_shifted = u_pred + du_dt / time_gap
         # u_shifted = u_pred
@@ -2477,7 +2478,13 @@ class SDTrainer(BaseSDTrainProcess):
         else:
             batch_list = [batch]
         total_loss = None
-        self.optimizer.zero_grad()
+        if self.train_config.gradient_accumulation_steps == 1:
+            # one accumulation window per call: start it clean. With
+            # gradient_accumulation_steps > 1 (or -1, whole epoch) the window
+            # spans several calls and the earlier micro-batches' grads must
+            # survive until the optimizer step; they are set to None right
+            # after optimizer.step() below instead.
+            self.optimizer.zero_grad()
         # micro-batches per optimizer step: a batch list (gradient_accumulation) or repeated
         # calls (gradient_accumulation_steps). -1 (whole epoch) has no fixed count; left summed.
         n_accum = len(batch_list)
@@ -2511,6 +2518,13 @@ class SDTrainer(BaseSDTrainProcess):
             # grads of memory-managed (offloaded) params are async D2H copies into
             # pinned tensors; join them before anything on the CPU reads .grad
             sync_grad_transfers()
+            # optimizers that accumulate low-precision grads stochastically park
+            # them in param._accum_grad and only put .grad back inside step();
+            # bring them back now so the clip below sees them (no-op for the
+            # other optimizers, and for the second call inside step)
+            _raw_optimizer = getattr(self.optimizer, 'optimizer', self.optimizer)
+            if hasattr(_raw_optimizer, 'step_hook'):
+                _raw_optimizer.step_hook()
             # fix this for multi params
             if self.train_config.optimizer != 'adafactor':
                 if isinstance(self.params[0], dict):

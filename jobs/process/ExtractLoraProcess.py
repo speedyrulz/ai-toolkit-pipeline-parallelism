@@ -42,6 +42,8 @@ class ExtractLoraProcess(BaseExtractProcess):
         self.linear = self.get_conf('linear', mode_dict[self.mode]['linear'], as_type=mode_dict[self.mode]['type'])
         self.linear_param = self.get_conf('linear', mode_dict[self.mode]['linear'], as_type=mode_dict[self.mode]['type'])
         self.conv_param = self.get_conf('conv', mode_dict[self.mode]['conv'], as_type=mode_dict[self.mode]['type'])
+        # run() and get_output_path() report the extraction size as dim
+        self.dim = self.linear_param
         self.use_sparse_bias = self.get_conf('use_sparse_bias', False)
         self.sparsity = self.get_conf('sparsity', 0.98)
 
@@ -59,7 +61,8 @@ class ExtractLoraProcess(BaseExtractProcess):
             self.use_sparse_bias,
             self.sparsity,
             small_conv=False,
-            linear_only=self.conv_param > 0.0000000001,
+            # conv layers are skipped only when no conv size was asked for
+            linear_only=self.conv_param <= 0.0000000001,
             extract_unet=self.extract_unet,
             extract_text_encoder=self.extract_text_encoder
         )

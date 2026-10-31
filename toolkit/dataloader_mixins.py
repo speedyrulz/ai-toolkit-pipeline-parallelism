@@ -73,6 +73,24 @@ transforms_dict = {
 }
 
 img_ext_list = ['.jpg', '.jpeg', '.png', '.webp']
+
+
+_folder_image_cache: Dict[str, tuple] = {}
+
+
+def _list_folder_images(folder: str) -> tuple:
+    # listed once per process: control_from_same_folder / clip_image_from_same_folder
+    # used to glob the whole folder for every item on every fetch
+    files = _folder_image_cache.get(folder)
+    if files is None:
+        found = []
+        for ext in img_ext_list:
+            found += glob.glob(os.path.join(folder, f'*{ext}'))
+        files = tuple(found)
+        _folder_image_cache[folder] = files
+    return files
+
+
 video_ext_list = ['.mp4', '.avi', '.mov', '.webm', '.mkv', '.wmv', '.m4v', '.flv']
 
 
@@ -155,15 +173,15 @@ class CaptionMixin:
         default_prompt_path_with_ext = os.path.join(os.path.dirname(img_path), 'default' + ext)
 
         if os.path.exists(prompt_path):
-            with open(prompt_path, 'r', encoding='utf-8') as f:
+            with open(prompt_path, 'r', encoding='utf-8-sig') as f:
                 prompt = f.read()
                 prompt = clean_caption(prompt)
         elif os.path.exists(default_prompt_path_with_ext):
-            with open(default_prompt_path_with_ext, 'r', encoding='utf-8') as f:
+            with open(default_prompt_path_with_ext, 'r', encoding='utf-8-sig') as f:
                 prompt = f.read()
                 prompt = clean_caption(prompt)
         elif os.path.exists(default_prompt_path):
-            with open(default_prompt_path, 'r', encoding='utf-8') as f:
+            with open(default_prompt_path, 'r', encoding='utf-8-sig') as f:
                 prompt = f.read()
                 prompt = clean_caption(prompt)
         else:
@@ -337,7 +355,16 @@ class BucketsMixin:
                 new_width = bucket_resolution["width"]
                 new_height = bucket_resolution["height"]
 
-                if item_config.random_crop:
+                if item_config.random_crop and getattr(self, 'is_caching_latents', False):
+                    # the crop offsets are part of the latent cache key: a random
+                    # crop would re-encode (and re-store) every image on every run
+                    # for a single fixed crop, so fall back to the center crop
+                    if not getattr(self, '_warned_random_crop_cache', False):
+                        print_acc("random_crop is ignored while caching latents (the center crop is used)")
+                        self._warned_random_crop_cache = True
+                    file_item.crop_x = int((file_item.scale_to_width - new_width) / 2)
+                    file_item.crop_y = int((file_item.scale_to_height - new_height) / 2)
+                elif item_config.random_crop:
                     # random crop
                     crop_x = random.randint(0, file_item.scale_to_width - new_width)
                     crop_y = random.randint(0, file_item.scale_to_height - new_height)
@@ -416,7 +443,7 @@ class CaptionProcessingDTOMixin:
             short_caption = None
 
             if os.path.exists(prompt_path):
-                with open(prompt_path, 'r', encoding='utf-8') as f:
+                with open(prompt_path, 'r', encoding='utf-8-sig') as f:
                     prompt = f.read()
                     short_caption = None
                     prompt = clean_caption(prompt)
@@ -530,14 +557,17 @@ class CaptionProcessingDTOMixin:
                         new_token_list.append(token)
             token_list = new_token_list
 
-        if self.dataset_config.shuffle_tokens:
+        # with cached text embeddings the caption is encoded once, so a shuffle or
+        # random trigger would be one fixed draw and a new cache file every run
+        caption_is_cached = bool(getattr(self.dataset_config, 'cache_text_embeddings', False))
+        if self.dataset_config.shuffle_tokens and not caption_is_cached:
             random.shuffle(token_list)
 
         # join back together
         caption = ', '.join(token_list) if token_list is not None else raw_caption
         caption = inject_trigger_into_prompt(caption, trigger, to_replace_list, add_if_not_present)
 
-        if self.dataset_config.random_triggers:
+        if self.dataset_config.random_triggers and not caption_is_cached:
             num_triggers = self.dataset_config.random_triggers_max
             if num_triggers > 1:
                 num_triggers = random.randint(0, num_triggers)
@@ -551,7 +581,7 @@ class CaptionProcessingDTOMixin:
                 #     trigger = self.dataset_config.random_triggers[int(random.random() * (len(self.dataset_config.random_triggers)))]
                 #     caption = caption + ', ' + trigger
 
-        if self.dataset_config.shuffle_tokens:
+        if self.dataset_config.shuffle_tokens and not caption_is_cached:
             # shuffle again
             token_list = [t.strip() for t in caption.split(',')]
             random.shuffle(token_list)
@@ -1002,8 +1032,9 @@ class ImageProcessingDTOMixin:
 
         if self.use_alpha_as_mask:
             # we do this to make sure it does not replace the alpha with another color
-            # we want the image just without the alpha channel
-            np_img = np.array(img)
+            # we want the image just without the alpha channel (RGBA first so an
+            # RGB jpeg or a palette png does not index a missing channel)
+            np_img = np.array(img.convert('RGBA'))
             # strip off alpha
             np_img = np_img[:, :, :3]
             img = Image.fromarray(np_img)
@@ -1238,10 +1269,8 @@ class ControlFileItemDTOMixin:
         if self.dataset_config.control_from_same_folder:
             # randomly grab image paths from the same folder as if they came from control_path
             pool_folder = os.path.dirname(self.path)
-            # find all images in the folder
-            img_files = []
-            for ext in img_ext_list:
-                img_files += glob.glob(os.path.join(pool_folder, f'*{ext}'))
+            # find all images in the folder (listed once per process)
+            img_files = list(_list_folder_images(pool_folder))
             # remove the current image if len is greater than 1
             if len(img_files) > 1:
                 img_files.remove(self.path)
@@ -1282,6 +1311,9 @@ class ControlFileItemDTOMixin:
             except Exception as e:
                 print_acc(f"Error: {e}")
                 print_acc(f"Error loading image: {control_path}")
+                # do not continue with the previous control's pixels (or an unbound
+                # img); the loader swaps the whole item for another one
+                raise
             
             if not self.full_size_control_images:
                 # we just scale them to 512x512:
@@ -1465,10 +1497,8 @@ class ClipImageFileItemDTOMixin:
         if self.dataset_config.clip_image_from_same_folder:
             # randomly grab an image path from the same folder
             pool_folder = os.path.dirname(self.path)
-            # find all images in the folder
-            img_files = []
-            for ext in img_ext_list:
-                img_files += glob.glob(os.path.join(pool_folder, f'*{ext}'))
+            # find all images in the folder (listed once per process)
+            img_files = list(_list_folder_images(pool_folder))
             # remove the current image if len is greater than 1
             if len(img_files) > 1:
                 img_files.remove(self.path)
@@ -1709,7 +1739,8 @@ class MaskFileItemDTOMixin:
 
         if self.use_alpha_as_mask:
             # pipeline expectws an rgb image so we need to put alpha in all channels
-            np_img = np.array(img)
+            # (sources without an alpha channel get an opaque one: keep everything)
+            np_img = np.array(img.convert('RGBA'))
             np_img[:, :, :3] = np_img[:, :, 3:]
 
             np_img = np_img[:, :, :3]
@@ -2081,6 +2112,9 @@ class LatentCachingMixin:
             # use tqdm to show progress
             i = 0
             failed_items = []
+            # latent path -> the first item cached for it (num_repeats creates one
+            # FileItemDTO per repeat, all pointing at the same latent)
+            done_by_path = {}
             pbar = tqdm(total=len(self.file_list), desc=f'Caching latents{" to disk" if to_disk else ""}')
             executor = ThreadPoolExecutor(max_workers=num_workers)
             try:
@@ -2099,6 +2133,18 @@ class LatentCachingMixin:
                         failed_items.append(file_item)
                         pbar.update(1)
                         continue
+                    if to_memory and latent_path in done_by_path:
+                        # a repeat of an item already in memory: alias its latent
+                        # instead of encoding (or loading) another copy
+                        src = done_by_path[latent_path]
+                        for attr in ('_encoded_latent', '_cached_first_frame_latent', '_cached_tensor_uint8',
+                                     '_cached_waveform_int16', '_cached_waveform_sample_rate'):
+                            if hasattr(src, attr):
+                                setattr(file_item, attr, getattr(src, attr))
+                        file_item.is_latent_cached = True
+                        i += 1
+                        pbar.update(1)
+                        continue
                     if needs_encode and not did_move:
                         self.sd.set_device_state_preset('cache_latents')
                         did_move = True
@@ -2113,6 +2159,7 @@ class LatentCachingMixin:
                     for warning in getattr(self.sd, 'pop_encode_warnings', lambda: [])():
                         pbar.write(f"{file_item.path}: {warning}")
                     file_item.is_latent_cached = True
+                    done_by_path[latent_path] = file_item
                     i += 1
                     pbar.update(1)
             finally:
@@ -2557,6 +2604,12 @@ class TextEmbeddingCachingMixin:
             i = 0
             for file_item in tqdm(self.file_list, desc='Caching text embeddings to disk'):
                 file_item.latent_load_device = self.sd.device
+
+                if getattr(file_item, 'raw_caption', None) is None:
+                    # load the caption WITH the dataset's caption dict: the cache key
+                    # below would otherwise fall back to a sidecar .txt / default
+                    # caption for json datasets and cache the wrong embedding
+                    file_item.load_caption(getattr(self, 'caption_dict', None))
 
                 text_embedding_path = file_item.get_text_embedding_path(recalculate=True)
                 # (path, caption) pairs to encode for this item

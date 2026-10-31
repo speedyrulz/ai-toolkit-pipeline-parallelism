@@ -364,7 +364,7 @@ class DiffusionFeatureExtractor3(nn.Module):
                 self.losses[key] /= self.log_every
                 # print in 2.000e-01 format
                 print(f" - {key}: {self.losses[key]:.3e}")
-            self.losses[key] = 0.0
+                self.losses[key] = 0.0
         
         # total_loss += mse_loss
         self.step += 1
@@ -1072,7 +1072,7 @@ class DiffusionFeatureExtractor7(nn.Module):
                     self.losses[key] /= self.log_every
                     # print in 2.000e-01 format
                     print(f" - {key}: {self.losses[key]:.3e}")
-                self.losses[key] = 0.0
+                    self.losses[key] = 0.0
             
             # total_loss += mse_loss
             self.step += 1
@@ -1221,7 +1221,11 @@ class DiffusionFeatureExtractor9(nn.Module):
         perceptual_loss = torch.nn.functional.mse_loss(
             pred.float(), target.float(), reduction="none"
         )
-        velocity_equiv_weight = (1.0 / torch.clamp(tv, min=0.01) ** 2)
+        # reduce to one value per sample first: the features are (B, N, C) while
+        # the weight is (B, 1, 1, 1), so a direct product would broadcast to
+        # (B, B, N, C) and weight every sample by every other sample's weight
+        perceptual_loss = perceptual_loss.mean(dim=list(range(1, perceptual_loss.ndim)))
+        velocity_equiv_weight = (1.0 / torch.clamp(tv, min=0.01) ** 2).flatten()
         loss_perceptual = (perceptual_loss * velocity_equiv_weight).mean()
         
         if self.do_partial_step:
@@ -1238,7 +1242,7 @@ class DiffusionFeatureExtractor9(nn.Module):
                     self.losses[key] /= self.log_every
                     # print in 2.000e-01 format
                     print(f" - {key}: {self.losses[key]:.3e}")
-                self.losses[key] = 0.0
+                    self.losses[key] = 0.0
             
             # total_loss += mse_loss
             self.step += 1
@@ -1404,7 +1408,7 @@ class DiffusionFeatureExtractor10(nn.Module):
                     self.losses[key] /= self.log_every
                     # print in 2.000e-01 format
                     print(f" - {key}: {self.losses[key]:.3e}")
-                self.losses[key] = 0.0
+                    self.losses[key] = 0.0
 
             # total_loss += mse_loss
             self.step += 1

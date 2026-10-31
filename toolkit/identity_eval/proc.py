@@ -48,19 +48,26 @@ class JsonProcess:
         self._log.write(f"\n===== {time.strftime('%Y-%m-%d %H:%M:%S')} starting {self.name}: {' '.join(self.cmd)}\n")
         self._log.flush()
         creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if sys.platform == "win32" else 0
-        self.proc = subprocess.Popen(
-            self.cmd,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            bufsize=1,
-            env=self.env,
-            cwd=self.cwd,
-            creationflags=creationflags,
-        )
+        try:
+            self.proc = subprocess.Popen(
+                self.cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                bufsize=1,
+                env=self.env,
+                cwd=self.cwd,
+                creationflags=creationflags,
+            )
+        except OSError as e:
+            # a missing interpreter (evaluator_python typo) is a ChildError like
+            # any other start failure, so callers can disable the feature
+            self._log.close()
+            self._log = None
+            raise ChildError(f"{self.name} could not start ({e}): {self.cmd[0]!r}") from e
         threading.Thread(target=self._read_loop, daemon=True).start()
         deadline = time.time() + ready_timeout
         with self._cond:
@@ -113,8 +120,12 @@ class JsonProcess:
             req_id = self._next_id
             self._next_id += 1
         line = json.dumps({"id": req_id, "cmd": cmd, **payload})
-        self.proc.stdin.write(line + "\n")
-        self.proc.stdin.flush()
+        try:
+            self.proc.stdin.write(line + "\n")
+            self.proc.stdin.flush()
+        except (OSError, ValueError) as e:
+            # the child died between the alive check and the write
+            raise ChildError(f"{self.name} pipe closed: {e}") from e
         return req_id
 
     def wait(self, req_id: int, timeout: Optional[float] = None) -> dict:

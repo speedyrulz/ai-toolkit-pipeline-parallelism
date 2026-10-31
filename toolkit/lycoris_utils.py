@@ -433,14 +433,14 @@ def rebuild_weight(module_type, params, orig_weight, scale=1):
     elif module_type == 'kron':
         w1, w1a, w1b, w2, w2a, w2b, t1, t2, alpha = params
         if alpha is not None and (w1b is not None or w2b is not None):
-            scale *= alpha / (w1b.size(0) if w1b else w2b.size(0))
+            scale *= alpha / (w1b.size(0) if w1b is not None else w2b.size(0))
         if w1a is not None and w1b is not None:
-            if t1:
+            if t1 is not None:
                 w1 = cp_weight(w1a, w1b, t1)
             else:
                 w1 = w1a @ w1b
         if w2a is not None and w2b is not None:
-            if t2:
+            if t2 is not None:
                 w2 = cp_weight(w2a, w2b, t2)
             else:
                 w2 = w2a @ w2b

@@ -691,7 +691,7 @@ class CustomAdapter(torch.nn.Module):
                         latents = torch.cat((latents, control_latent), dim=1)
                         return latents.detach()
                     
-                if control_tensor is None:
+                if batch.control_tensor is None:
                     # concat zeros onto the latents
                     ctrl = torch.zeros(
                         latents.shape[0], # bs

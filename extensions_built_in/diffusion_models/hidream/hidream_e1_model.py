@@ -42,7 +42,7 @@ class HidreamE1Model(HidreamModel):
             aggressive_unloading=self.low_vram,
         )
 
-        pipeline = pipeline.to(self.device_torch)
+        pipeline = self.move_pipeline_for_sampling(pipeline)
 
         return pipeline
 
@@ -116,7 +116,8 @@ class HidreamE1Model(HidreamModel):
         with torch.no_grad():
             control_tensor = batch.control_tensor
             if control_tensor is not None:
-                self.vae.to(self.device_torch)
+                # the control pixels below go to vae_device_torch; the vae must be there too
+                self.vae.to(self.vae_device_torch)
                 # we are not packed here, so we just need to pass them so we can pack them later
                 control_tensor = control_tensor * 2 - 1
                 control_tensor = control_tensor.to(

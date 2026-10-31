@@ -679,7 +679,9 @@ class LearnableSNRGamma:
                 if len(self.buffer) > self.max_buffer_size:
                     self.buffer.pop(0)
             all_snr = get_all_snr(self.noise_scheduler, loss.device)
-            snr: torch.Tensor = torch.stack([all_snr[t] for t in timesteps]).detach().float().to(loss.device)
+            # one gather instead of a per-element 0-d index (a gpu sync each)
+            ts = torch.as_tensor(timesteps, device=all_snr.device).long()
+            snr: torch.Tensor = all_snr[ts].detach().float().to(loss.device)
         base_snrs = snr.clone().detach()
         snr.requires_grad = True
         snr = (snr + self.offset_1) * self.scale + self.offset_2
@@ -738,7 +740,9 @@ def apply_snr_weight(
     offset = 0
     if noise_scheduler.timesteps[0] == 1000:
         offset = 1
-    snr = torch.stack([all_snr[(t - offset).int()] for t in timesteps])
+    # one gather instead of a per-element 0-d index (a gpu sync each)
+    ts = torch.as_tensor(timesteps, device=all_snr.device).long() - offset
+    snr = all_snr[ts]
     gamma_over_snr = torch.div(torch.ones_like(snr) * gamma, snr)
     if fixed:
         snr_weight = gamma_over_snr.float().to(loss.device)  # directly using gamma over snr
