@@ -1,6 +1,6 @@
 'use client';
 
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { ArrowUp, Box, File, Folder, FolderOpen, HardDrive, Home, Loader2 } from 'lucide-react';
 import { Modal } from '@/components/Modal';
 import { apiClient } from '@/utils/api';
@@ -70,18 +70,28 @@ export default function ModelBrowserModal({ isOpen, onClose, onPick, initialPath
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [pathInput, setPathInput] = useState('');
+  // requests can overlap (Enter in the path box is not disabled while loading);
+  // only the latest one may update the listing
+  const requestSeq = useRef(0);
 
   const load = useCallback((p?: string) => {
+    const mine = ++requestSeq.current;
     setLoading(true);
     setError(null);
     return apiClient
       .get('/api/models/browse', { params: p ? { path: p } : {} })
       .then(r => {
+        if (mine !== requestSeq.current) return;
         setListing(r.data);
         setPathInput(r.data.path);
       })
-      .catch(e => setError(e?.response?.data?.error || e?.message || 'Unable to read folder'))
-      .finally(() => setLoading(false));
+      .catch(e => {
+        if (mine !== requestSeq.current) return;
+        setError(e?.response?.data?.error || e?.message || 'Unable to read folder');
+      })
+      .finally(() => {
+        if (mine === requestSeq.current) setLoading(false);
+      });
   }, []);
 
   useEffect(() => {

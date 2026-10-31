@@ -245,13 +245,13 @@ class CustomLCMScheduler(SchedulerMixin, ConfigMixin):
 
         # standard deviation of the initial noise distribution
         self.init_noise_sigma = 1.0
-        self.original_inference_steps = 50
+        self.original_inference_steps = original_inference_steps
 
         # setable values
         self.num_inference_steps = None
         self.timesteps = torch.from_numpy(np.arange(0, num_train_timesteps)[::-1].copy().astype(np.int64))
 
-        self.train_timesteps = 1000
+        self.train_timesteps = num_train_timesteps
 
         self._step_index = None
 
@@ -332,6 +332,7 @@ class CustomLCMScheduler(SchedulerMixin, ConfigMixin):
         num_inference_steps: int,
         device: Union[str, torch.device] = None,
         strength: int = 1.0,
+        original_inference_steps: Union[int, None] = None,
     ):
         """
         Sets the discrete timesteps used for the diffusion chain (to be run before inference).
@@ -348,7 +349,9 @@ class CustomLCMScheduler(SchedulerMixin, ConfigMixin):
                 our final timestep schedule. If not set, this will default to the `original_inference_steps` attribute.
         """
 
-        original_inference_steps = self.original_inference_steps
+        if original_inference_steps is None:
+            # the caller may override the configured value (training uses the full schedule)
+            original_inference_steps = self.original_inference_steps
 
         if num_inference_steps > self.config.num_train_timesteps:
             raise ValueError(

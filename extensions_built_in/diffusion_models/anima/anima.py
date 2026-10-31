@@ -320,7 +320,7 @@ class AnimaModel(BaseModel):
             text_conditioner=trainable_model.text_conditioner,
             vae=unwrap_model(self.vae),
         )
-        pipeline = pipeline.to(self.device_torch)
+        pipeline = self.move_pipeline_for_sampling(pipeline)
 
         # ModularPipeline.set_progress_bar_config only walks one level of sub_blocks,
         # but the tqdm bar lives in the loop block nested two levels deep. Must use

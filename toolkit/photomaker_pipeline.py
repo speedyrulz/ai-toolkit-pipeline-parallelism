@@ -18,6 +18,7 @@ from diffusers.utils import (
     logging,
 )
 
+from diffusers.pipelines.stable_diffusion_xl.pipeline_stable_diffusion_xl import rescale_noise_cfg
 from .photomaker import PhotoMakerIDEncoder
 
 PipelineImageInput = Union[

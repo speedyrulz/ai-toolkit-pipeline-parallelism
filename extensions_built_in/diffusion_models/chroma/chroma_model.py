@@ -181,7 +181,7 @@ class ChromaModel(BaseModel):
         self.noise_scheduler = ChromaModel.get_train_scheduler()
         
         self.print_and_status_update("Loading VAE")
-        vae = KLVAE.load_model(extras_path, dtype=dtype, device=self.device_torch)
+        vae = KLVAE.load_model(extras_path, dtype=dtype, device=self.vae_device_torch)
 
         self.print_and_status_update("Making pipe")
 

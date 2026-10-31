@@ -61,6 +61,12 @@ export async function POST(request: Request) {
     const { id, name, job_config } = body;
     let gpu_ids: string = body.gpu_ids;
 
+    // the name becomes a folder under the training root (and is deleted recursively
+    // with the job), so it must stay a single, plain path segment
+    if (typeof name !== 'string' || name.trim() === '' || name.includes('..') || /[\\/:*?"<>|]/.test(name)) {
+      return NextResponse.json({ error: 'Invalid job name: it is used as a folder name' }, { status: 400 });
+    }
+
     if (isMac()) {
       gpu_ids = 'mps';
     }

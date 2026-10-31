@@ -39,7 +39,7 @@ CONV_MODULES = [
 ]
 
 ExtractMode = Union[
-    'existing'
+    'existing',
     'fixed',
     'threshold',
     'ratio',
@@ -309,6 +309,10 @@ class ToolkitModuleMixin:
         lora_input = x.to(self.lora_down.weight.dtype)
         lora_output = self._call_forward(lora_input)
         multiplier = self.network_ref().torch_multiplier
+        if multiplier.device != lora_output.device:
+            # the multiplier lives on the first module's device; under pipeline
+            # sharding (or a text encoder pinned to te_device) this layer may not
+            multiplier = multiplier.to(lora_output.device)
 
         lora_output_batch_size = lora_output.size(0)
         multiplier_batch_size = multiplier.size(0)

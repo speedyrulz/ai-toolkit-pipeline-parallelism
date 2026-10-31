@@ -36,6 +36,7 @@ class ControlGenerator:
         self.control_pose_model = None
         self.control_line_model = None
         self.control_bg_remover = None
+        self.control_sapiens_matting = None
         self.debug = False
         self.regen = False
 
@@ -224,14 +225,15 @@ class ControlGenerator:
             return self.postprocess(result, image, control_type)
         elif control_type in ['sapiens2_mask']:
             self.debug_print("Generating sapiens2_mask control")
-            if self.control_bg_remover is None:
+            # its own slot: control_bg_remover holds BiRefNet for inpaint/mask
+            if self.control_sapiens_matting is None:
                 from toolkit.models.sapiens2 import Sapiens2Matting
-                self.control_bg_remover = Sapiens2Matting.from_pretrained(
+                self.control_sapiens_matting = Sapiens2Matting.from_pretrained(
                     device=device,
                     dtype=torch.float16
                 )
             img = image.copy()
-            img = self.control_bg_remover(img)
+            img = self.control_sapiens_matting(img)
             return img
         else:
             raise Exception(f"Error: unknown control type {control_type}")
@@ -252,6 +254,8 @@ class ControlGenerator:
             self.control_line_model = None
         if self.control_bg_remover is not None:
             self.control_bg_remover = None
+        if self.control_sapiens_matting is not None:
+            self.control_sapiens_matting = None
         if self.sd is not None and self.has_unloaded:
             self.sd.restore_device_state()
         self.has_unloaded = False

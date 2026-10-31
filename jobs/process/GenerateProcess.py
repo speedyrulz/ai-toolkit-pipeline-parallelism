@@ -102,7 +102,8 @@ class GenerateProcess(BaseProcess):
             if self.model_config.is_lumina2:
                 arch = 'lumina2'
             sampler = get_sampler(
-                self.train_config.noise_scheduler,
+                # a generate job has no train config; use the generate config's sampler
+                (self.get_conf('generate', {}) or {}).get('sampler', 'ddpm'),
                 {
                     "prediction_type": "v_prediction" if self.model_config.is_v_pred else "epsilon",
                 },

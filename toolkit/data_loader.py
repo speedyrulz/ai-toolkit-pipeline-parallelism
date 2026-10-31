@@ -567,7 +567,12 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
                     encode_first_frame_in_text_embeddings=getattr(self.sd, 'encode_first_frame_in_text_embeddings', False) if self.sd else False,
                     dopsd_self_ref=getattr(self.sd, 'dopsd_self_ref', False) if self.sd else False,
                     teacher_conditions=getattr(self.sd, 'teacher_conditions', None) if self.sd else None,
-                    teacher_caption_fn=getattr(self.sd, 'build_teacher_caption', None) if self.sd else None,
+                    # a picklable builder (never a bound method: items are deep-copied
+                    # per fetch and pickled into spawned workers)
+                    teacher_caption_fn=(
+                        self.sd.get_teacher_caption_fn() if hasattr(self.sd, 'get_teacher_caption_fn')
+                        else getattr(self.sd, 'build_teacher_caption', None)
+                    ) if self.sd else None,
                     text_embedding_space_version=text_embedding_space_version,
                     text_embedding_uses_target_size=getattr(self.sd, 'text_embedding_uses_target_size', False) if self.sd else False,
                     te_padding_side=self.sd.te_padding_side if self.sd else "right",
@@ -640,9 +645,16 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
                 self.cache_latents_all_latents()
             if self.is_caching_clip_vision_to_disk:
                 self.cache_clip_vision_to_disk()
+            controls_in_text_embeds = self.is_generating_controls and bool(
+                getattr(self.sd, 'encode_control_in_text_embeddings', False)
+            )
+            if controls_in_text_embeds:
+                # the control image is part of the text embedding (and of its
+                # cache key), so it has to exist before the embeddings are cached
+                self.setup_controls()
             if self.is_caching_text_embeddings:
                 self.cache_text_embeddings()
-            if self.is_generating_controls:
+            if self.is_generating_controls and not controls_in_text_embeds:
                 # always do this last
                 self.setup_controls()
         self.epoch_num += 1

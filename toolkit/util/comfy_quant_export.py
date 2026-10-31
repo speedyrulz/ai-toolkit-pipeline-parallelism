@@ -83,7 +83,7 @@ def export_comfy_quantized_layers(
                 )
             entries[f"{name}.comfy_quant"] = comfy_quant_marker({"format": "nvfp4"})
         elif hasattr(module, "f8_qdata"):
-            entries[f"{name}.weight"] = module.f8_qdata.detach().cpu().contiguous()
+            entries[f"{name}.weight"] = module.f8_qdata.detach().view(torch.float8_e4m3fn).cpu().contiguous()
             entries[f"{name}.weight_scale"] = (
                 module.f8_scale.view(torch.float32).detach().cpu().reshape(())
             )

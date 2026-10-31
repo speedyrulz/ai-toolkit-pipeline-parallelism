@@ -57,22 +57,20 @@ class CustomFlowMatchEulerDiscreteScheduler(FlowMatchEulerDiscreteScheduler):
             pass
 
     def get_weights_for_timesteps(self, timesteps: torch.Tensor, v2=False, timestep_type="linear", x0_pred=False) -> torch.Tensor:
-        # Get the indices of the timesteps
-        step_indices = [(self.timesteps == t).nonzero().item()
-                        for t in timesteps]
+        # Get the indices of the timesteps as one gather (a .nonzero().item()
+        # per element is a gpu sync each)
+        sched = self.timesteps.to(timesteps.device)
+        step_indices = (sched[None, :] == timesteps[:, None]).int().argmax(dim=1)
 
         # Get the weights for the timesteps
         if timestep_type == "weighted":
             weighing_scheme = x0_weighing_scheme if x0_pred else default_weighing_scheme
-            weights = torch.tensor(
-                [weighing_scheme[i] for i in step_indices],
-                device=timesteps.device,
-                dtype=timesteps.dtype
-            )
+            table = torch.as_tensor(weighing_scheme, device=timesteps.device, dtype=torch.float32)
+            weights = table[step_indices].to(dtype=timesteps.dtype)
         elif v2:
-            weights = self.linear_timesteps_weights2[step_indices].flatten()
+            weights = self.linear_timesteps_weights2.to(timesteps.device)[step_indices].flatten()
         else:
-            weights = self.linear_timesteps_weights[step_indices].flatten()
+            weights = self.linear_timesteps_weights.to(timesteps.device)[step_indices].flatten()
 
         return weights
 
@@ -80,8 +78,8 @@ class CustomFlowMatchEulerDiscreteScheduler(FlowMatchEulerDiscreteScheduler):
         sigmas = self.sigmas.to(device=device, dtype=dtype)
         schedule_timesteps = self.timesteps.to(device)
         timesteps = timesteps.to(device)
-        step_indices = [(schedule_timesteps == t).nonzero().item()
-                        for t in timesteps]
+        # one gather instead of a per-element .nonzero().item() sync
+        step_indices = (schedule_timesteps[None, :] == timesteps[:, None]).int().argmax(dim=1)
 
         sigma = sigmas[step_indices].flatten()
         while len(sigma.shape) < n_dim:
@@ -117,6 +115,9 @@ class CustomFlowMatchEulerDiscreteScheduler(FlowMatchEulerDiscreteScheduler):
         if timestep_type == 'linear' or timestep_type == 'weighted':
             timesteps = torch.linspace(1000, 1, num_timesteps, device=device)
             self.timesteps = timesteps
+            # keep the sigma table in step with the timesteps (get_sigmas indexes
+            # it by timestep position; add_noise uses t / 1000 for these types)
+            self.sigmas = torch.cat([timesteps / self.config.num_train_timesteps, torch.zeros(1, device=device)])
             return timesteps
         elif timestep_type == 'sigmoid':
             # distribute them closer to center. Inference distributes them as a bias toward first
@@ -130,6 +131,7 @@ class CustomFlowMatchEulerDiscreteScheduler(FlowMatchEulerDiscreteScheduler):
             timesteps, _ = torch.sort(timesteps, descending=True)
 
             self.timesteps = timesteps.to(device=device)
+            self.sigmas = torch.cat([self.timesteps / self.config.num_train_timesteps, torch.zeros(1, device=device)])
 
             return timesteps
         elif timestep_type in ['flux_shift', 'lumina2_shift', 'shift']:
@@ -146,9 +148,15 @@ class CustomFlowMatchEulerDiscreteScheduler(FlowMatchEulerDiscreteScheduler):
                     raise ValueError('latents is None')
 
                 # for flux we double up the patch size before sending her to simulate the latent reduction
-                h = latents.shape[2]
-                w = latents.shape[3]
-                image_seq_len = h * w // (patch_size**2)
+                if latents.ndim == 5:
+                    # video latents (B, C, F, H, W): the token count spans the frames too,
+                    # as the inference pipelines compute it from the packed sequence
+                    f, h, w = latents.shape[2], latents.shape[3], latents.shape[4]
+                    image_seq_len = f * h * w // (patch_size**2)
+                else:
+                    h = latents.shape[2]
+                    w = latents.shape[3]
+                    image_seq_len = h * w // (patch_size**2)
 
                 mu = calculate_shift(
                     image_seq_len,
@@ -215,6 +223,9 @@ class CustomFlowMatchEulerDiscreteScheduler(FlowMatchEulerDiscreteScheduler):
 
             timesteps = timesteps.to(torch.int)
             self.timesteps = timesteps.to(device=device)
+            self.sigmas = torch.cat(
+                [self.timesteps.float() / self.config.num_train_timesteps, torch.zeros(1, device=device)]
+            )
             return timesteps
         else:
             raise ValueError(f"Invalid timestep type: {timestep_type}")

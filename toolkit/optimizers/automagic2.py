@@ -197,11 +197,18 @@ class Automagic2(torch.optim.Optimizer):
         out = []
         for group in self.param_groups:
             lrs = [
-                float(self.state[p]["lr"])
+                self.state[p]["lr"]
                 for p in group["params"]
                 if p in self.state and "lr" in self.state[p]
             ]
-            out.append(sum(lrs) / len(lrs) if lrs else float(group["lr"]))
+            if lrs:
+                # one device->host sync per group instead of one per parameter
+                dev = lrs[0].device
+                out.append(
+                    float(torch.stack([t if t.device == dev else t.to(dev) for t in lrs]).mean())
+                )
+            else:
+                out.append(float(group["lr"]))
         return out
 
     def get_avg_learning_rate(self) -> float:

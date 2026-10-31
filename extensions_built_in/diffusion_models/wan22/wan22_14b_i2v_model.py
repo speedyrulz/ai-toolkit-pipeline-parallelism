@@ -120,6 +120,13 @@ class Wan2214bI2VModel(Wan2214bModel):
         # images come in (bs, channels, height, width)
         with torch.no_grad():
             frames = batch.tensor
+            if frames is None:
+                raise ValueError(
+                    "wan22_14b_i2v conditions on the first frame in pixel space (the whole "
+                    "zero-padded clip is vae-encoded), but this batch has no pixels: with cached "
+                    "latents set `load_image_when_caching_latents: true` on the dataset, or do not "
+                    "cache latents for i2v training"
+                )
             if len(frames.shape) == 4:
                 first_frames = frames
             elif len(frames.shape) == 5:

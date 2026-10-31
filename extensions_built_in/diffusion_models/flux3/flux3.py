@@ -625,7 +625,7 @@ class Flux3Model(BaseModel):
         save_dict = {}
         for k, v in state_dict.items():
             save_dict[k] = (
-                dequantize_if_quantized(v).clone().to("cpu", dtype=save_dtype)
+                dequantize_if_quantized(v).detach().to("cpu", dtype=save_dtype)
             )
         meta = get_meta_for_safetensors(meta, name=self.arch)
         save_file(save_dict, output_path, metadata=meta)

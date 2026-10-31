@@ -473,7 +473,7 @@ class Wan21(BaseModel):
                 scheduler=scheduler,
             )
 
-        pipeline = pipeline.to(self.device_torch)
+        pipeline = self.move_pipeline_for_sampling(pipeline)
 
         return pipeline
 
@@ -495,7 +495,7 @@ class Wan21(BaseModel):
     ):
         # reactivate progress bar since this is slooooow
         pipeline.set_progress_bar_config(disable=False)
-        pipeline = pipeline.to(self.device_torch)
+        pipeline = self.move_pipeline_for_sampling(pipeline)
 
         if self.use_vae_tiling:
             # set vae to tile decode

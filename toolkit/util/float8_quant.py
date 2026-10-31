@@ -34,7 +34,10 @@ class Float8Quantizer(OstrisQuantizer):
     ) -> None:
         """Register the quantized representation on the module. Used both by
         quantize_ and by importers of pre-quantized checkpoints."""
-        module.register_buffer("f8_qdata", qweight.contiguous(), persistent=False)
+        # stored as a uint8 view: Module.to(dtype=...) casts every floating
+        # buffer, and float8 counts as floating, so a real fp8 buffer would be
+        # inflated to bf16 by the trainer's whole-model dtype casts
+        module.register_buffer("f8_qdata", qweight.contiguous().view(torch.uint8), persistent=False)
         module.register_buffer(
             "f8_scale",
             scale.detach().float().clone().reshape(1).view(torch.uint8),
@@ -43,11 +46,11 @@ class Float8Quantizer(OstrisQuantizer):
 
     def dequantize(self, module: "OstrisLinear") -> torch.Tensor:
         scale = module.f8_scale.view(torch.float32)[0]
-        return module.f8_qdata.to(torch.float32) * scale
+        return module.f8_qdata.view(torch.float8_e4m3fn).to(torch.float32) * scale
 
     @torch.no_grad()
     def requantize_(self, module: "OstrisLinear", fp_weight: torch.Tensor) -> None:
         w = fp_weight.to(torch.float32)
         scale = (w.abs().max() / F8_MAX).clamp(min=1e-12)
-        module.f8_qdata.copy_((w / scale).clamp(-F8_MAX, F8_MAX).to(torch.float8_e4m3fn))
+        module.f8_qdata.copy_((w / scale).clamp(-F8_MAX, F8_MAX).to(torch.float8_e4m3fn).view(torch.uint8))
         module.f8_scale.copy_(scale.reshape(1).view(torch.uint8))

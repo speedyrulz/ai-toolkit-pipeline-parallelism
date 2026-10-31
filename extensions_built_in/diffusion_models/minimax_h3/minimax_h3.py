@@ -292,39 +292,19 @@ class MinimaxH3Model(BaseModel):
             float(unshift_sigma(max(t_lower, t_upper) / 1000.0, shift)),
         )
 
+    def get_teacher_caption_fn(self):
+        """The teacher caption builder handed to the data loader. It is a partial
+        of a module-level function over plain values: the loader deep-copies
+        every file item per fetch and pickles them into spawned workers, and a
+        bound method would drag the whole model (weights included) along."""
+        tm = self.teacher_matching
+        return partial(
+            _build_teacher_caption, tm.conditions, tm.caption_style, self._image_ref_video_frames() > 0
+        )
+
     def build_teacher_caption(self, caption: str, file_item) -> str:
         """The caption the teacher's text rows are encoded from."""
-        tm = self.teacher_matching
-        is_video = bool(getattr(file_item, "is_video", False))
-        if tm.conditions == TEACHER_CONDITIONS_REF:
-            if tm.caption_style == "token":
-                # upstream D-OPSD: trigger word -> the self-reference token,
-                # or the token prepended when there is no trigger word
-                token = "<Video 1>" if is_video else "<Picture 1>"
-                trigger = getattr(file_item, "trigger_word", None)
-                if trigger is not None:
-                    return caption.replace(trigger, token)
-                return f"{token} {caption}".strip()
-            return wrap_ref_teacher_caption(caption, is_video=is_video)
-        if tm.conditions == TEACHER_CONDITIONS_SUBJECT_REF:
-            refs = getattr(file_item, "control_path", None)
-            if refs is None:
-                refs = []
-            elif not isinstance(refs, list):
-                refs = [refs]
-            if len(refs) == 0:
-                raise ValueError(
-                    "subject_ref teacher matching needs reference pictures on every "
-                    f"item (a control_path dataset); none for {getattr(file_item, 'path', '?')}"
-                )
-            as_video = self._image_ref_video_frames() > 0
-            return wrap_subject_reference_caption(
-                caption,
-                len(refs),
-                still_image=not is_video,
-                ref_label="Video" if as_video else "Picture",
-            )
-        raise ValueError(f"no teacher caption for teacher_conditions {tm.conditions!r}")
+        return self.get_teacher_caption_fn()(caption, file_item)
 
     def _image_ref_video_frames(self) -> int:
         # ref2va overrides; the base model keeps native <Picture> references
@@ -1851,3 +1831,37 @@ class MinimaxH3OmniModel(MinimaxH3Ref2VAModel):
         if n:
             return f"minimax_h3_ref2va:img_as_vid{n}"
         return "minimax_h3_ref2va"
+
+
+def _build_teacher_caption(conditions, caption_style, as_video: bool, caption: str, file_item) -> str:
+    """Module-level so functools.partial over it pickles by reference (see
+    MinimaxH3.get_teacher_caption_fn)."""
+    is_video = bool(getattr(file_item, "is_video", False))
+    if conditions == TEACHER_CONDITIONS_REF:
+        if caption_style == "token":
+            # upstream D-OPSD: trigger word -> the self-reference token,
+            # or the token prepended when there is no trigger word
+            token = "<Video 1>" if is_video else "<Picture 1>"
+            trigger = getattr(file_item, "trigger_word", None)
+            if trigger is not None:
+                return caption.replace(trigger, token)
+            return f"{token} {caption}".strip()
+        return wrap_ref_teacher_caption(caption, is_video=is_video)
+    if conditions == TEACHER_CONDITIONS_SUBJECT_REF:
+        refs = getattr(file_item, "control_path", None)
+        if refs is None:
+            refs = []
+        elif not isinstance(refs, list):
+            refs = [refs]
+        if len(refs) == 0:
+            raise ValueError(
+                "subject_ref teacher matching needs reference pictures on every "
+                f"item (a control_path dataset); none for {getattr(file_item, 'path', '?')}"
+            )
+        return wrap_subject_reference_caption(
+            caption,
+            len(refs),
+            still_image=not is_video,
+            ref_label="Video" if as_video else "Picture",
+        )
+    raise ValueError(f"no teacher caption for teacher_conditions {conditions!r}")

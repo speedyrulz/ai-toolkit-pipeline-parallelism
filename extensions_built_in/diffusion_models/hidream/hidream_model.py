@@ -118,7 +118,7 @@ class HidreamModel(BaseModel):
         self.print_and_status_update("Loading vae")
         
         vae = KLVAE.load_model(extras_path, dtype=torch.bfloat16).to(
-            self.device_torch, dtype=dtype
+            self.vae_device_torch, dtype=dtype
         )
         
         
@@ -233,7 +233,7 @@ class HidreamModel(BaseModel):
             aggressive_unloading=self.low_vram
         )
 
-        pipeline = pipeline.to(self.device_torch)
+        pipeline = self.move_pipeline_for_sampling(pipeline)
 
         return pipeline
 

@@ -439,7 +439,7 @@ class DataLoaderBatchDTO:
                 # find one to use as a base
                 base_unconditional_tensor = None
                 for x in self.file_items:
-                    if x.unaugmented_tensor is not None:
+                    if x.unconditional_tensor is not None:
                         base_unconditional_tensor = x.unconditional_tensor
                         break
                 unconditional_tensor = []
@@ -625,6 +625,25 @@ class DataLoaderBatchDTO:
         del self.first_frame_latents
         for file_item in self.file_items:
             file_item.cleanup()
+
+    def pin_memory(self):
+        # torch's pin-memory thread only pins tensors, mappings and sequences it
+        # recognizes; a custom batch object has to pin its own tensors or the
+        # dataloader's pin_memory=True is a silent no-op
+        for name in ('_tensor', '_tensor_uint8', '_latents', 'control_tensor', 'clip_image_tensor', 'mask_tensor',
+                     'unaugmented_tensor', 'unconditional_tensor', 'unconditional_latents', 'inpaint_tensor',
+                     'audio_tensor', 'first_frame_latents', 'sigmas', 'extra_values'):
+            t = getattr(self, name, None)
+            if not torch.is_tensor(t) or t.device.type != 'cpu' or t.is_pinned():
+                continue
+            try:
+                pinned = t.pin_memory()
+            except RuntimeError:
+                continue
+            if isinstance(t, DTO) and not isinstance(pinned, DTO):
+                pinned = DTO(pinned, **t.extras)
+            setattr(self, name, pinned)
+        return self
 
     @property
     def dataset_config(self) -> "DatasetConfig":

@@ -422,7 +422,7 @@ class TrainESRGANProcess(BaseTrainProcess):
     def run(self):
         super().run()
         self.load_datasets()
-        steps_per_step = (self.critic.num_critic_per_gen + 1)
+        steps_per_step = (self.critic.num_critic_per_gen + 1) if self.critic is not None else 1
 
         max_step_epochs = self.max_steps // (len(self.data_loader) // steps_per_step)
         num_epochs = self.epochs

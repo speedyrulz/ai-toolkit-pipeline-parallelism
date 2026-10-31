@@ -427,7 +427,9 @@ class LTX2Model(BaseModel):
         
         # quantize + offload + placement, all driven by model_config
         text_encoder.aitk_post_load(**self.component_load_kwargs("te"))
-        text_encoder.to(self.device_torch, dtype=dtype)
+        if not self.low_vram:
+            # aitk_post_load already placed it (cpu under low_vram, te_device otherwise)
+            text_encoder.to(self.te_device_torch, dtype=dtype)
         flush()
 
         self.print_and_status_update("Loading VAEs and other components")
@@ -596,7 +598,7 @@ class LTX2Model(BaseModel):
         pipeline.transformer = unwrap_model(self.model)
         pipeline.text_encoder = unwrap_model(self.text_encoder[0])
 
-        pipeline = pipeline.to(self.device_torch)
+        pipeline = self.move_pipeline_for_sampling(pipeline)
 
         return pipeline
 
@@ -637,7 +639,7 @@ class LTX2Model(BaseModel):
 
         # reactivate progress bar since this is slooooow
         pipeline.set_progress_bar_config(disable=False)
-        pipeline = pipeline.to(self.device_torch)
+        pipeline = self.move_pipeline_for_sampling(pipeline)
 
         # make sure dimensions are valid
         bd = self.get_bucket_divisibility()
@@ -1384,7 +1386,9 @@ class LTX25Model(LTX2Model):
         # quantize + offload + placement, all driven by model_config
         text_encoder.aitk_post_load(**self.component_load_kwargs("te"))
 
-        text_encoder.to(self.device_torch)
+        if not self.low_vram:
+            # aitk_post_load already placed it (cpu under low_vram, te_device otherwise)
+            text_encoder.to(self.te_device_torch)
         text_encoder.requires_grad_(False)
         text_encoder.eval()
         flush()

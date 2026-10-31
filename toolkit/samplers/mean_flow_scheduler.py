@@ -39,20 +39,18 @@ class MeanFlowScheduler(FlowMatchEulerDiscreteScheduler):
             pass
 
     def get_weights_for_timesteps(
-        self, timesteps: torch.Tensor, v2=False, timestep_type="linear"
+        self, timesteps: torch.Tensor, v2=False, timestep_type="linear", x0_pred=False
     ) -> torch.Tensor:
-        # Get the indices of the timesteps
-        step_indices = [(self.timesteps == t).nonzero().item() for t in timesteps]
+        # same signature as the flow-match scheduler (the trainer passes x0_pred)
+        # and always a tensor: the caller moves it with .to(). One gather instead
+        # of a .nonzero().item() sync per element.
+        weights = torch.ones_like(timesteps, dtype=torch.float32)
 
-        weights = 1.0
-
-        # Get the weights for the timesteps
         if timestep_type == "weighted":
-            weights = torch.tensor(
-                [default_weighing_scheme[i] for i in step_indices],
-                device=timesteps.device,
-                dtype=timesteps.dtype,
-            )
+            sched = self.timesteps.to(timesteps.device)
+            step_indices = (sched[None, :] == timesteps[:, None]).int().argmax(dim=1)
+            table = torch.as_tensor(default_weighing_scheme, device=timesteps.device, dtype=torch.float32)
+            weights = table[step_indices]
 
         return weights
 

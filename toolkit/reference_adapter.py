@@ -35,6 +35,9 @@ import torch.nn.functional as F
 import torch.nn as nn
 
 
+from diffusers.models.attention_processor import AttnProcessor2_0
+
+
 class ReferenceAttnProcessor2_0(torch.nn.Module):
     r"""
         Attention processor for IP-Adapater for PyTorch 2.0.
@@ -296,10 +299,11 @@ class ReferenceAdapter(torch.nn.Module):
             skip = True
 
         if not skip:
-            if self.sd_ref().network is not None:
-                self.sd_ref().network.is_active = True
-            if self.sd_ref().network.is_merged_in:
-                raise ValueError("network is merged in, but we are not supposed to be merged in")
+            network = self.sd_ref().network
+            if network is not None:
+                network.is_active = True
+                if network.is_merged_in:
+                    raise ValueError("network is merged in, but we are not supposed to be merged in")
                 # send it through our forward first
             self.forward(sample, timestep, encoder_hidden_states, *args, **kwargs)
 
@@ -307,7 +311,7 @@ class ReferenceAdapter(torch.nn.Module):
             self.sd_ref().network.is_active = False
 
         # Send it through the original unet forward
-        return self._original_unet_forward(sample, timestep, encoder_hidden_states, args, **kwargs)
+        return self._original_unet_forward(sample, timestep, encoder_hidden_states, *args, **kwargs)
 
 
     # use drop for prompt dropout, or negatives

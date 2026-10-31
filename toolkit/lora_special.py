@@ -211,6 +211,9 @@ class FullModule(ToolkitModuleMixin, torch.nn.Module):
         # dequantize quantized weights to full precision so the delta can be added (the original
         # quantized tensor is restored in the finally block below)
         base_weight = _dequantize_if_needed(orig_weight)
+        if isinstance(mult, torch.Tensor) and mult.device != base_weight.device:
+            # the network multiplier lives on the first module's device (pipeline sharding / te_device)
+            mult = mult.to(base_weight.device)
         eff_weight = base_weight + (self.diff.to(base_weight.device) * mult).to(base_weight.dtype)
 
         has_bias = self.diff_b is not None and om._parameters.get('bias', None) is not None

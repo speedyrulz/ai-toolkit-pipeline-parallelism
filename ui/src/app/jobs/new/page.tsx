@@ -152,11 +152,20 @@ export default function TrainingForm() {
     if (status === 'saving') return;
     setStatus('saving');
 
+    // a pipeline-sharded job occupies every shard device, not just the selected one:
+    // the queue, CUDA_VISIBLE_DEVICES and the overview all read gpu_ids
+    const model = jobConfig.config.process[0].model as any;
+    const shardGpuIds = model?.pipeline_sharding
+      ? ((model.pipeline_devices as string[] | undefined) ?? gpuList.map((gpu: any) => `cuda:${gpu.index}`))
+          .map((d: string) => d.split(':')[1])
+          .join(',')
+      : '';
+
     apiClient
       .post('/api/jobs', {
         id: runId,
         name: jobConfig.config.name,
-        gpu_ids: gpuIDs,
+        gpu_ids: shardGpuIds || gpuIDs,
         job_config: jobConfig,
       })
       .then(res => {

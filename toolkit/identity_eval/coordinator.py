@@ -190,7 +190,12 @@ class IdentityEval:
                 return False
             self.anchors = anchors
             self.calibration_id = cal_id
-            self._prepare_workers(gpu_session)  # templates are rebuilt; anchors are reused
+            try:
+                self._prepare_workers(gpu_session)  # templates are rebuilt; anchors are reused
+            except ChildError as e:
+                print_acc(f"Identity eval disabled, reference preparation failed: {e}")
+                self.close()
+                return False
             print_acc(f"Identity eval: reusing calibration {cal_id[:19]}")
         else:
             if not self._calibrate(render, gpu_session, fingerprint, cal_id):
@@ -384,14 +389,21 @@ class IdentityEval:
         gpu_roles = [r for r in ROLES if self.gpus[r] is not None and self.gpus[r] >= 0]
         if (gpu_roles and helper is not None and self.second_gpu is not None
                 and any(self.gpus[r] == self.second_gpu for r in gpu_roles)):
-            helper.offload()
-            self._helper_offloaded = helper
+            try:
+                helper.offload()
+                self._helper_offloaded = helper
+            except ChildError as e:
+                print_acc(f"Identity eval: the sample helper could not free its gpu ({e}); "
+                          f"skipping the scoring round for step {step}")
+                return
         try:
-            ids, tail = {}, {}
+            ids, tail, head = {}, {}, {}
             for r in ROLES:
-                # each worker answers in order: load, score, unload
+                # each worker answers in order: load, score, unload. The load
+                # reply is tracked too, so a failed hand-off is reported instead
+                # of surfacing as per-image scoring failures
                 if r in gpu_roles:
-                    self.workers[r].send("to_gpu")
+                    head[r] = self.workers[r].send("to_gpu")
                 ids[r] = self.workers[r].send("score", images=images[r])
                 if r in gpu_roles:
                     tail[r] = self.workers[r].send("to_cpu")
@@ -400,13 +412,17 @@ class IdentityEval:
             return
         where = ", ".join(sorted(set(self.devices().values())))
         print_acc(f"Identity eval: scoring step {step} on {where} beside training")
-        self._pending.append({"step": step, "ids": ids, "tail": tail, "t0": time.time(), "results": {}})
+        self._pending.append({"step": step, "ids": ids, "tail": tail, "head": head, "t0": time.time(), "results": {}})
         self._write_status("scoring", step)
 
     def _advance(self):
         still = []
         for p in self._pending:
             try:
+                for r, req in list(p.get("head", {}).items()):
+                    # a to_gpu failure raises ChildError here with its own message
+                    if self.workers[r].poll(req) is not None:
+                        del p["head"][r]
                 for r, req in list(p["ids"].items()):
                     reply = self.workers[r].poll(req)
                     if reply is not None:
@@ -455,8 +471,13 @@ class IdentityEval:
             self._write_status("scoring" if self._pending else "idle",
                                self._pending[0]["step"] if self._pending else None)
         if self._helper_offloaded is not None:
-            self._helper_offloaded.onload()
-            self._helper_offloaded = None
+            helper, self._helper_offloaded = self._helper_offloaded, None
+            try:
+                helper.onload()
+            except ChildError as e:
+                # the trainer drops a failed helper on its next call; do not
+                # end the run from here
+                print_acc(f"Identity eval: the sample helper could not reload its model ({e})")
 
     def finish(self, timeout_s: float) -> List[dict]:
         deadline = time.time() + timeout_s
