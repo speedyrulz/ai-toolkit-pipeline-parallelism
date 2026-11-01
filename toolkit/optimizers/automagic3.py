@@ -372,7 +372,8 @@ class Automagic3(torch.optim.Optimizer):
         # identical multiplicative nudges, so these stay equal; storing per
         # param rides the normal state_dict machinery and tolerates
         # multi-device groups).
-        state["lr"] = torch.tensor(
+        state["lr"] = torch.full(  # (torch.full: no blocking host copy per param)
+            (),
             min(max(float(group["lr"]), group["min_lr"]), group["max_lr"]),
             dtype=torch.float32,
             device=p.device,
@@ -643,9 +644,23 @@ class Automagic3(torch.optim.Optimizer):
         lrs = self.get_learning_rates()
         return sum(lrs) / len(lrs) if lrs else float(self.defaults["lr"])
 
+    def _saved_fp32(self, state_dict, key: str) -> dict:
+        # {param: saved state[key] as fp32}, read before the parent's load
+        # casts it to the param dtype (a bf16 model's adapted lr would be
+        # rounded by up to 0.4% at every resume). Same id mapping as torch.
+        out = {}
+        saved = state_dict.get("state", {})
+        for sg, g in zip(state_dict.get("param_groups", []), self.param_groups):
+            for pid, p in zip(sg["params"], g["params"]):
+                v = saved.get(pid, {}).get(key)
+                if isinstance(v, torch.Tensor) and v.is_floating_point():
+                    out[p] = v.detach().to(p.device, torch.float32, copy=True)
+        return out
+
     def load_state_dict(self, state_dict):
-        # Parent casts every fp state tensor to param.dtype; force lr back to fp32
-        # so subsequent lr bumps aren't rounded away on bf16 weights.
+        # Parent casts every fp state tensor to param.dtype; lr is restored
+        # from the saved fp32 values so it isn't rounded on bf16 weights.
+        exact = self._saved_fp32(state_dict, "lr")
         super().load_state_dict(state_dict)
         # Hyperparameters are NOT loaded from the checkpoint: constructor args
         # always win, so any setting can be changed mid-run just by passing a
@@ -659,7 +674,7 @@ class Automagic3(torch.optim.Optimizer):
             # median (they are already identical for checkpoints from this
             # version; older per-tensor checkpoints land on a sane middle).
             lrs = [
-                st["lr"]
+                exact.get(p, st["lr"])
                 for p in group["params"]
                 if (st := self.state.get(p)) is not None
                 and isinstance(st.get("lr"), torch.Tensor)
@@ -669,9 +684,7 @@ class Automagic3(torch.optim.Optimizer):
                 dev = lrs[0].device
                 med = (
                     torch.stack([t.to(torch.float32).to(dev) for t in lrs])
-                    .log_()
-                    .median()
-                    .exp_()
+                    .median()  # (= the geometric median, no log/exp round trip)
                 )
             for p in group["params"]:
                 st = self.state.get(p)
